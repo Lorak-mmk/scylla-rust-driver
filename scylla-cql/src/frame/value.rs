@@ -577,7 +577,7 @@ impl Value for Unset {
 
 impl Value for Counter {
     fn serialize(&self, buf: &mut Vec<u8>) -> Result<(), ValueTooBig> {
-        self.0.serialize(buf)
+        Value::serialize(&self.0, buf)
     }
 }
 
@@ -602,7 +602,7 @@ impl<V: Value> Value for MaybeUnset<V> {
     fn serialize(&self, buf: &mut Vec<u8>) -> Result<(), ValueTooBig> {
         match self {
             MaybeUnset::Set(v) => v.serialize(buf),
-            MaybeUnset::Unset => Unset.serialize(buf),
+            MaybeUnset::Unset => Value::serialize(&Unset, buf),
         }
     }
 }
@@ -733,28 +733,28 @@ impl Value for CqlValue {
                 serialize_tuple(fields.iter().map(|(_, value)| value), buf)
             }
 
-            CqlValue::Date(d) => Date(*d).serialize(buf),
-            CqlValue::Duration(d) => d.serialize(buf),
-            CqlValue::Timestamp(t) => Timestamp(*t).serialize(buf),
-            CqlValue::Time(t) => Time(*t).serialize(buf),
+            CqlValue::Date(d) => Value::serialize(&Date(*d), buf),
+            CqlValue::Duration(d) => Value::serialize(&d, buf),
+            CqlValue::Timestamp(t) => Value::serialize(&Timestamp(*t), buf),
+            CqlValue::Time(t) => Value::serialize(&Time(*t), buf),
 
-            CqlValue::Ascii(s) | CqlValue::Text(s) => s.serialize(buf),
-            CqlValue::List(v) | CqlValue::Set(v) => v.serialize(buf),
+            CqlValue::Ascii(s) | CqlValue::Text(s) => Value::serialize(&s, buf),
+            CqlValue::List(v) | CqlValue::Set(v) => Value::serialize(&v, buf),
 
-            CqlValue::Blob(b) => b.serialize(buf),
-            CqlValue::Boolean(b) => b.serialize(buf),
-            CqlValue::Counter(c) => c.serialize(buf),
-            CqlValue::Decimal(d) => d.serialize(buf),
-            CqlValue::Double(d) => d.serialize(buf),
-            CqlValue::Float(f) => f.serialize(buf),
-            CqlValue::Int(i) => i.serialize(buf),
-            CqlValue::BigInt(i) => i.serialize(buf),
-            CqlValue::Inet(i) => i.serialize(buf),
-            CqlValue::SmallInt(s) => s.serialize(buf),
-            CqlValue::TinyInt(t) => t.serialize(buf),
-            CqlValue::Timeuuid(t) => t.serialize(buf),
-            CqlValue::Uuid(u) => u.serialize(buf),
-            CqlValue::Varint(v) => v.serialize(buf),
+            CqlValue::Blob(b) => Value::serialize(&b, buf),
+            CqlValue::Boolean(b) => Value::serialize(&b, buf),
+            CqlValue::Counter(c) => Value::serialize(&c, buf),
+            CqlValue::Decimal(d) => Value::serialize(&d, buf),
+            CqlValue::Double(d) => Value::serialize(&d, buf),
+            CqlValue::Float(f) => Value::serialize(&f, buf),
+            CqlValue::Int(i) => Value::serialize(&i, buf),
+            CqlValue::BigInt(i) => Value::serialize(&i, buf),
+            CqlValue::Inet(i) => Value::serialize(&i, buf),
+            CqlValue::SmallInt(s) => Value::serialize(&s, buf),
+            CqlValue::TinyInt(t) => Value::serialize(&t, buf),
+            CqlValue::Timeuuid(t) => Value::serialize(&t, buf),
+            CqlValue::Uuid(u) => Value::serialize(&u, buf),
+            CqlValue::Varint(v) => Value::serialize(&v, buf),
 
             CqlValue::Empty => serialize_empty(buf),
         }
