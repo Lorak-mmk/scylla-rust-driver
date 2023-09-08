@@ -12,6 +12,8 @@ use std::net::IpAddr;
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::response::result::ColumnSpec;
+use super::response::result::ColumnType;
 use super::response::result::CqlValue;
 use super::types::vint_encode;
 
@@ -1168,5 +1170,826 @@ impl<'a, 'f: 'a, IT: BatchValuesIterator<'a>> BatchValuesIterator<'a>
     fn skip_next(&mut self) -> Option<()> {
         self.rest.skip_next();
         self.first.take().map(|_| ())
+    }
+}
+
+//
+//
+// Serialization implementation after refactor
+//
+//
+
+// TODO: Change the name to SerializeValuesError when the original one is removed
+// to minimize breakage
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+enum SerializationError {
+    #[error("Too many values to add, max 32 767 values can be sent in a request")]
+    TooManyValues,
+    #[error("Mixing named and not named values is not allowed")]
+    MixingNamedAndNotNamedValues,
+    #[error(transparent)]
+    ValueTooBig(#[from] ValueTooBig),
+    #[error("Parsing serialized values failed")]
+    ParseError,
+    #[error("Invalid variable type for given marker`")]
+    InvalidType,
+    // TODO: better name?
+    #[error("Can't bind more vars than there are placeholders in prepared statement")]
+    MoreValuesThanColumns,
+}
+
+trait SerializeCql {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError>;
+}
+
+/// Enum providing a way to represent a value that might be unset
+/// TODO: Rename this to MaybeUnset when finishing refactor
+#[derive(Clone, Copy)]
+enum MaybeUnsetCql<V: SerializeCql> {
+    Unset,
+    Set(V),
+}
+
+struct RowSerializationContext<'a> {
+    columns: &'a [ColumnSpec],
+}
+
+impl<'a> RowSerializationContext<'a> {
+    fn column_by_idx(&self, i: usize) -> Option<&ColumnSpec> {
+        self.columns.get(i)
+    }
+
+    // TODO: change RowSerializationContext to make this faster
+    fn column_by_name(&self, target: &str) -> Option<&ColumnSpec> {
+        for c in self.columns {
+            if c.name == target {
+                return Some(c);
+            }
+        }
+
+        return None;
+    }
+}
+
+trait SerializeRow {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SerializationError>;
+}
+
+//
+//  SerializeCql impls
+//
+
+// Implement SerializeCql for primitive types
+
+macro_rules! perform_type_check {
+    ($column_type: expr, $($TypeName:ident),+) => {
+        match $column_type {
+            $(ColumnType::$TypeName => (),)+
+            _ => return Err(SerializationError::InvalidType), // TODO: show more information to the user
+        }
+    };
+    ($column_type: expr, $($match_arm:pat => $result:expr),+) => {
+        match $column_type {
+            $($match_arm => $result,)+
+            _ => return Err(SerializationError::InvalidType), // TODO: show more information to the user
+        }
+    }
+}
+
+impl SerializeCql for i8 {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, TinyInt);
+        buf.put_i32(1);
+        buf.put_i8(*self);
+        Ok(())
+    }
+}
+
+impl SerializeCql for i16 {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, SmallInt);
+        buf.put_i32(2);
+        buf.put_i16(*self);
+        Ok(())
+    }
+}
+
+impl SerializeCql for i32 {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Int);
+        buf.put_i32(4);
+        buf.put_i32(*self);
+        Ok(())
+    }
+}
+
+impl SerializeCql for i64 {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, BigInt);
+        buf.put_i32(8);
+        buf.put_i64(*self);
+        Ok(())
+    }
+}
+
+impl SerializeCql for BigDecimal {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Decimal);
+        let (value, scale) = self.as_bigint_and_exponent();
+
+        let serialized = value.to_signed_bytes_be();
+        let serialized_len: i32 = serialized.len().try_into().map_err(|_| ValueTooBig)?;
+
+        buf.put_i32(serialized_len + 4);
+        buf.put_i32(scale.try_into().map_err(|_| ValueTooBig)?);
+        buf.put_slice(&serialized);
+
+        Ok(())
+    }
+}
+
+impl SerializeCql for NaiveDate {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Date);
+        buf.put_i32(4);
+        let unix_epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+
+        let days: u32 = self
+            .signed_duration_since(unix_epoch)
+            .num_days()
+            .checked_add(1 << 31)
+            .and_then(|days| days.try_into().ok()) // convert to u32
+            .ok_or(ValueTooBig)?;
+
+        buf.put_u32(days);
+        Ok(())
+    }
+}
+
+impl SerializeCql for Date {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Date);
+        buf.put_i32(4);
+        buf.put_u32(self.0);
+        Ok(())
+    }
+}
+
+impl SerializeCql for Timestamp {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Timestamp);
+        buf.put_i32(8);
+        buf.put_i64(self.0.num_milliseconds());
+        Ok(())
+    }
+}
+
+impl SerializeCql for Time {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Time);
+        buf.put_i32(8);
+        buf.put_i64(self.0.num_nanoseconds().ok_or(ValueTooBig)?);
+        Ok(())
+    }
+}
+
+impl SerializeCql for DateTime<Utc> {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Timestamp);
+        buf.put_i32(8);
+        buf.put_i64(self.timestamp_millis());
+        Ok(())
+    }
+}
+
+#[cfg(feature = "secret")]
+impl<V: SerializeCql + Zeroize> SerializeCql for Secret<V> {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        self.expose_secret().serialize(buf)
+    }
+}
+
+impl SerializeCql for bool {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Boolean);
+        buf.put_i32(1);
+        let false_bytes: &[u8] = &[0x00];
+        let true_bytes: &[u8] = &[0x01];
+        if *self {
+            buf.put(true_bytes);
+        } else {
+            buf.put(false_bytes);
+        }
+
+        Ok(())
+    }
+}
+
+impl SerializeCql for f32 {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Float);
+        buf.put_i32(4);
+        buf.put_f32(*self);
+        Ok(())
+    }
+}
+
+impl SerializeCql for f64 {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Double);
+        buf.put_i32(8);
+        buf.put_f64(*self);
+        Ok(())
+    }
+}
+
+impl SerializeCql for Uuid {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Uuid, Timeuuid);
+        buf.put_i32(16);
+        buf.put_slice(self.as_bytes());
+        Ok(())
+    }
+}
+
+impl SerializeCql for BigInt {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Varint);
+        let serialized = self.to_signed_bytes_be();
+        let serialized_len: i32 = serialized.len().try_into().map_err(|_| ValueTooBig)?;
+
+        buf.put_i32(serialized_len);
+        buf.put_slice(&serialized);
+
+        Ok(())
+    }
+}
+
+impl SerializeCql for &str {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Text);
+        let str_bytes: &[u8] = self.as_bytes();
+        let val_len: i32 = str_bytes.len().try_into().map_err(|_| ValueTooBig)?;
+
+        buf.put_i32(val_len);
+        buf.put_slice(str_bytes);
+
+        Ok(())
+    }
+}
+
+impl SerializeCql for Vec<u8> {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Blob);
+        <&[u8] as SerializeCql>::serialize(&self.as_slice(), typ, buf)
+    }
+}
+
+impl SerializeCql for &[u8] {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Blob);
+        let val_len: i32 = self.len().try_into().map_err(|_| ValueTooBig)?;
+        buf.put_i32(val_len);
+
+        buf.put_slice(self);
+
+        Ok(())
+    }
+}
+
+impl<const N: usize> SerializeCql for [u8; N] {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Blob);
+        let val_len: i32 = self.len().try_into().map_err(|_| ValueTooBig)?;
+        buf.put_i32(val_len);
+
+        buf.put_slice(self);
+
+        Ok(())
+    }
+}
+
+impl SerializeCql for IpAddr {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Inet);
+        match self {
+            IpAddr::V4(addr) => {
+                buf.put_i32(4);
+                buf.put_slice(&addr.octets());
+            }
+            IpAddr::V6(addr) => {
+                buf.put_i32(16);
+                buf.put_slice(&addr.octets());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl SerializeCql for String {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Text);
+        <&str as SerializeCql>::serialize(&self.as_str(), typ, buf)
+    }
+}
+
+/// Every `Option<T>` can be serialized as None -> NULL, Some(val) -> val.serialize()
+impl<T: SerializeCql> SerializeCql for Option<T> {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        match self {
+            Some(val) => <T as SerializeCql>::serialize(val, typ, buf),
+            None => {
+                buf.put_i32(-1);
+                Ok(())
+            }
+        }
+    }
+}
+
+impl SerializeCql for Unset {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        // Unset serializes itself to empty value with length = -2
+        buf.put_i32(-2);
+        Ok(())
+    }
+}
+
+impl SerializeCql for Counter {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Counter);
+        SerializeCql::serialize(&self.0, typ, buf)
+    }
+}
+
+impl SerializeCql for CqlDuration {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        perform_type_check!(typ, Duration);
+        let bytes_num_pos: usize = buf.len();
+        buf.put_i32(0);
+
+        vint_encode(self.months as i64, buf);
+        vint_encode(self.days as i64, buf);
+        vint_encode(self.nanoseconds, buf);
+
+        let written_bytes: usize = buf.len() - bytes_num_pos - 4;
+        let written_bytes_i32: i32 = written_bytes.try_into().map_err(|_| ValueTooBig)?;
+        buf[bytes_num_pos..(bytes_num_pos + 4)].copy_from_slice(&written_bytes_i32.to_be_bytes());
+
+        Ok(())
+    }
+}
+
+impl<V: SerializeCql> SerializeCql for MaybeUnsetCql<V> {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        match self {
+            MaybeUnsetCql::Set(v) => v.serialize(typ, buf),
+            MaybeUnsetCql::Unset => SerializeCql::serialize(&Unset, typ, buf),
+        }
+    }
+}
+
+// Every &impl SerializeCql and &dyn SerializeCql should also implement SerializeCql
+impl<T: SerializeCql + ?Sized> SerializeCql for &T {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        <T as SerializeCql>::serialize(*self, typ, buf)
+    }
+}
+
+// Every Boxed SerializeCql should also implement SerializeCql
+impl<T: SerializeCql + ?Sized> SerializeCql for Box<T> {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        <T as SerializeCql>::serialize(self.as_ref(), typ, buf)
+    }
+}
+
+// TODO: Rename to serialize_map when finishing serialization refactor
+fn serialize_map_cql<K: SerializeCql, V: SerializeCql>(
+    kv_iter: impl Iterator<Item = (K, V)>,
+    kv_count: usize,
+    full_type: &ColumnType,
+    buf: &mut Vec<u8>,
+) -> Result<(), SerializationError> {
+    let (key_type, value_type) = perform_type_check!(full_type, ColumnType::Map(k, v) => (k, v));
+    let bytes_num_pos: usize = buf.len();
+    buf.put_i32(0);
+
+    buf.put_i32(kv_count.try_into().map_err(|_| ValueTooBig)?);
+    for (key, value) in kv_iter {
+        <K as SerializeCql>::serialize(&key, key_type, buf)?;
+        <V as SerializeCql>::serialize(&value, value_type, buf)?;
+    }
+
+    let written_bytes: usize = buf.len() - bytes_num_pos - 4;
+    let written_bytes_i32: i32 = written_bytes.try_into().map_err(|_| ValueTooBig)?;
+    buf[bytes_num_pos..(bytes_num_pos + 4)].copy_from_slice(&written_bytes_i32.to_be_bytes());
+
+    Ok(())
+}
+
+// TODO: Rename to serialize_list_or_set when finishing serialization refactor
+fn serialize_list_or_set_cql<'a, V: 'a + SerializeCql>(
+    elements_iter: impl Iterator<Item = &'a V>,
+    element_count: usize,
+    full_type: &ColumnType,
+    buf: &mut Vec<u8>,
+) -> Result<(), SerializationError> {
+    let inner_type =
+        perform_type_check!(full_type, ColumnType::Set(t) => t, ColumnType::List(t) => t);
+    let bytes_num_pos: usize = buf.len();
+    buf.put_i32(0);
+
+    buf.put_i32(element_count.try_into().map_err(|_| ValueTooBig)?);
+    for value in elements_iter {
+        <V as SerializeCql>::serialize(value, inner_type, buf)?;
+    }
+
+    let written_bytes: usize = buf.len() - bytes_num_pos - 4;
+    let written_bytes_i32: i32 = written_bytes.try_into().map_err(|_| ValueTooBig)?;
+    buf[bytes_num_pos..(bytes_num_pos + 4)].copy_from_slice(&written_bytes_i32.to_be_bytes());
+
+    Ok(())
+}
+
+impl<V: SerializeCql> SerializeCql for HashSet<V> {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        serialize_list_or_set_cql(self.iter(), self.len(), typ, buf)
+    }
+}
+
+impl<K: SerializeCql, V: SerializeCql> SerializeCql for HashMap<K, V> {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        serialize_map_cql(self.iter(), self.len(), typ, buf)
+    }
+}
+
+impl<V: SerializeCql> SerializeCql for BTreeSet<V> {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        serialize_list_or_set_cql(self.iter(), self.len(), typ, buf)
+    }
+}
+
+impl<K: SerializeCql, V: SerializeCql> SerializeCql for BTreeMap<K, V> {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        serialize_map_cql(self.iter(), self.len(), typ, buf)
+    }
+}
+
+impl<T: SerializeCql> SerializeCql for Vec<T> {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        serialize_list_or_set_cql(self.iter(), self.len(), typ, buf)
+    }
+}
+
+impl<T: SerializeCql> SerializeCql for &[T] {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        serialize_list_or_set_cql(self.iter(), self.len(), typ, buf)
+    }
+}
+
+fn serialize_tuple_cql<V: SerializeCql>(
+    elem_iter: impl Iterator<Item = V>,
+    types: &[ColumnType],
+    buf: &mut Vec<u8>,
+) -> Result<(), SerializationError> {
+    let bytes_num_pos: usize = buf.len();
+    buf.put_i32(0);
+
+    for (i, elem) in elem_iter.enumerate() {
+        elem.serialize(types.get(i).ok_or(SerializationError::InvalidType)?, buf)?;
+    }
+
+    let written_bytes: usize = buf.len() - bytes_num_pos - 4;
+    let written_bytes_i32: i32 = written_bytes.try_into().map_err(|_| ValueTooBig)?;
+    buf[bytes_num_pos..(bytes_num_pos + 4)].copy_from_slice(&written_bytes_i32.to_be_bytes());
+
+    Ok(())
+}
+
+fn serialize_udt_cql<'a, V: SerializeCql>(
+    elem_iter: impl Iterator<Item = (&'a str, V)>,
+    types: &[(String, ColumnType)],
+    buf: &mut Vec<u8>,
+) -> Result<(), SerializationError> {
+    let bytes_num_pos: usize = buf.len();
+    buf.put_i32(0);
+
+    for (i, (field_name, elem)) in elem_iter.enumerate() {
+        let (tname, typ) = types.get(i).ok_or(SerializationError::InvalidType)?;
+        if *tname != field_name {
+            return Err(SerializationError::InvalidType);
+        }
+        elem.serialize(typ, buf)?;
+    }
+
+    let written_bytes: usize = buf.len() - bytes_num_pos - 4;
+    let written_bytes_i32: i32 = written_bytes.try_into().map_err(|_| ValueTooBig)?;
+    buf[bytes_num_pos..(bytes_num_pos + 4)].copy_from_slice(&written_bytes_i32.to_be_bytes());
+
+    Ok(())
+}
+
+// TODO: Remove `_cql` from name when finishing refactor
+fn serialize_empty_cql(buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+    buf.put_i32(0);
+    Ok(())
+}
+
+impl SerializeCql for CqlValue {
+    fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+        match self {
+            CqlValue::Map(m) => serialize_map_cql(m.iter().map(|(k, v)| (k, v)), m.len(), typ, buf),
+            CqlValue::Tuple(t) => {
+                let inner_types = perform_type_check!(typ, ColumnType::Tuple(t) => t);
+                serialize_tuple_cql(t.iter(), inner_types.as_slice(), buf)
+            }
+
+            // A UDT value is composed of successive [bytes] values, one for each field of the UDT
+            // value (in the order defined by the type), so they serialize in a same way tuples do.
+            CqlValue::UserDefinedType {
+                fields,
+                keyspace,
+                type_name,
+            } => {
+                let (type_keyspace, type_type_name, field_types) = perform_type_check!(typ, ColumnType::UserDefinedType {type_name, keyspace, field_types} => (keyspace, type_name, field_types));
+                if keyspace != type_keyspace {
+                    return Err(SerializationError::InvalidType);
+                }
+                if type_name != type_type_name {
+                    return Err(SerializationError::InvalidType);
+                }
+                serialize_udt_cql(
+                    fields.iter().map(|(k, v)| (k.as_str(), v)),
+                    field_types.as_slice(),
+                    buf,
+                )
+            }
+
+            CqlValue::Date(d) => SerializeCql::serialize(&Date(*d), typ, buf),
+            CqlValue::Duration(d) => SerializeCql::serialize(&d, typ, buf),
+            CqlValue::Timestamp(t) => SerializeCql::serialize(&Timestamp(*t), typ, buf),
+            CqlValue::Time(t) => SerializeCql::serialize(&Time(*t), typ, buf),
+
+            CqlValue::Ascii(s) | CqlValue::Text(s) => SerializeCql::serialize(&s, typ, buf),
+            CqlValue::List(v) | CqlValue::Set(v) => SerializeCql::serialize(&v, typ, buf),
+
+            CqlValue::Blob(b) => SerializeCql::serialize(&b, typ, buf),
+            CqlValue::Boolean(b) => SerializeCql::serialize(&b, typ, buf),
+            CqlValue::Counter(c) => SerializeCql::serialize(&c, typ, buf),
+            CqlValue::Decimal(d) => SerializeCql::serialize(&d, typ, buf),
+            CqlValue::Double(d) => SerializeCql::serialize(&d, typ, buf),
+            CqlValue::Float(f) => SerializeCql::serialize(&f, typ, buf),
+            CqlValue::Int(i) => SerializeCql::serialize(&i, typ, buf),
+            CqlValue::BigInt(i) => SerializeCql::serialize(&i, typ, buf),
+            CqlValue::Inet(i) => SerializeCql::serialize(&i, typ, buf),
+            CqlValue::SmallInt(s) => SerializeCql::serialize(&s, typ, buf),
+            CqlValue::TinyInt(t) => SerializeCql::serialize(&t, typ, buf),
+            CqlValue::Timeuuid(t) => SerializeCql::serialize(&t, typ, buf),
+            CqlValue::Uuid(u) => SerializeCql::serialize(&u, typ, buf),
+            CqlValue::Varint(v) => SerializeCql::serialize(&v, typ, buf),
+
+            CqlValue::Empty => serialize_empty_cql(buf),
+        }
+    }
+}
+
+macro_rules! impl_serialize_cql_for_tuple {
+    ( $($Ti:ident),* ; $($FieldI:tt),* ) => {
+    impl<$($Ti),+> SerializeCql for ($($Ti,)+)
+        where
+            $($Ti: SerializeCql),+
+        {
+            fn serialize(&self, typ: &ColumnType, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+                let inner = perform_type_check!(typ, ColumnType::Tuple(tuple) => tuple);
+                let bytes_num_pos: usize = buf.len();
+                buf.put_i32(0);
+                $(
+                    <$Ti as SerializeCql>::serialize(&self.$FieldI, inner.get($FieldI).ok_or(SerializationError::InvalidType)?, buf)?;
+                )*
+
+                let written_bytes: usize = buf.len() - bytes_num_pos - 4;
+                let written_bytes_i32: i32 = written_bytes.try_into().map_err(|_| ValueTooBig) ?;
+                buf[bytes_num_pos..(bytes_num_pos+4)].copy_from_slice(&written_bytes_i32.to_be_bytes());
+
+                Ok(())
+            }
+        }
+    }
+}
+
+impl_serialize_cql_for_tuple!(T0; 0);
+impl_serialize_cql_for_tuple!(T0, T1; 0, 1);
+impl_serialize_cql_for_tuple!(T0, T1, T2; 0, 1, 2);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3; 0, 1, 2, 3);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3, T4; 0, 1, 2, 3, 4);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3, T4, T5; 0, 1, 2, 3, 4, 5);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3, T4, T5, T6; 0, 1, 2, 3, 4, 5, 6);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7; 0, 1, 2, 3, 4, 5, 6, 7);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8; 0, 1, 2, 3, 4, 5, 6, 7, 8);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+impl_serialize_cql_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+
+//
+//  ValueList impls
+//
+
+// Implement ValueList for the unit type
+impl SerializeRow for () {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SerializationError> {
+        Ok(())
+    }
+}
+
+// Implement ValueList for &[] - u8 because otherwise rust can't infer type
+impl SerializeRow for [u8; 0] {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SerializationError> {
+        Ok(())
+    }
+}
+
+// Implement SerializeRow for slices of SerializeCql types
+impl<T: SerializeCql> SerializeRow for &[T] {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SerializationError> {
+        out.put_i16(
+            self.len()
+                .try_into()
+                .map_err(|_| SerializationError::TooManyValues)?,
+        );
+        for (i, val) in self.iter().enumerate() {
+            let column = ctx
+                .column_by_idx(i)
+                .ok_or(SerializationError::MoreValuesThanColumns)?;
+            val.serialize(&column.typ, out)?;
+        }
+
+        Ok(())
+    }
+}
+
+// Implement SerializeRow for Vec<SerializeCql>
+impl<T: SerializeCql> SerializeRow for Vec<T> {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SerializationError> {
+        SerializeRow::serialize(&self.as_slice(), ctx, out)
+    }
+}
+
+// Implement SerializeRow for maps, which serializes named values
+macro_rules! impl_value_list_for_map {
+    ($map_type:ident, $key_type:ty) => {
+        impl<T: SerializeCql> SerializeRow for $map_type<$key_type, T> {
+            fn serialize(
+                &self,
+                ctx: &RowSerializationContext<'_>,
+                out: &mut Vec<u8>,
+            ) -> Result<(), SerializationError> {
+                out.put_i16(
+                    self.len()
+                        .try_into()
+                        .map_err(|_| SerializationError::TooManyValues)?,
+                );
+                for (k, v) in self {
+                    let column = ctx
+                        .column_by_name(k)
+                        .ok_or(SerializationError::MoreValuesThanColumns)?;
+                    v.serialize(&column.typ, out)?;
+                }
+
+                Ok(())
+            }
+        }
+    };
+}
+
+impl_value_list_for_map!(HashMap, String);
+impl_value_list_for_map!(HashMap, &str);
+impl_value_list_for_map!(BTreeMap, String);
+impl_value_list_for_map!(BTreeMap, &str);
+
+// Implement SerializeRow for tuples of SerializeCql of size up to 16
+
+// Here is an example implementation for (T0, )
+// Further variants are done using a macro
+impl<T0: SerializeCql> SerializeRow for (T0,) {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SerializationError> {
+        out.put_i16(1);
+        let column = ctx
+            .column_by_idx(0)
+            .ok_or(SerializationError::MoreValuesThanColumns)?;
+        self.0.serialize(&column.typ, out)?;
+        Ok(())
+    }
+}
+
+macro_rules! impl_value_list_for_tuple {
+    ( $($Ti:ident),* ; $($FieldI:tt),* ; $size: expr) => {
+        impl<$($Ti),+> SerializeRow for ($($Ti,)+)
+        where
+            $($Ti: SerializeCql),+
+        {
+            fn serialize(
+                &self,
+                ctx: &RowSerializationContext<'_>,
+                out: &mut Vec<u8>,
+            ) -> Result<(), SerializationError> {
+                out.put_i16($size);
+                $(
+                    let column = ctx
+                        .column_by_idx($FieldI)
+                        .ok_or(SerializationError::MoreValuesThanColumns)?;
+                    self.$FieldI.serialize(&column.typ, out)?;
+                )*
+                Ok(())
+            }
+        }
+    }
+}
+
+impl_value_list_for_tuple!(T0, T1; 0, 1; 2);
+impl_value_list_for_tuple!(T0, T1, T2; 0, 1, 2; 3);
+impl_value_list_for_tuple!(T0, T1, T2, T3; 0, 1, 2, 3; 4);
+impl_value_list_for_tuple!(T0, T1, T2, T3, T4; 0, 1, 2, 3, 4; 5);
+impl_value_list_for_tuple!(T0, T1, T2, T3, T4, T5; 0, 1, 2, 3, 4, 5; 6);
+impl_value_list_for_tuple!(T0, T1, T2, T3, T4, T5, T6; 0, 1, 2, 3, 4, 5, 6; 7);
+impl_value_list_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7; 0, 1, 2, 3, 4, 5, 6, 7; 8);
+impl_value_list_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8; 0, 1, 2, 3, 4, 5, 6, 7, 8; 9);
+impl_value_list_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9; 10);
+impl_value_list_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10; 11);
+impl_value_list_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11; 12);
+impl_value_list_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12; 13);
+impl_value_list_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13; 14);
+impl_value_list_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14; 15);
+impl_value_list_for_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15;
+                           0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15; 16);
+
+// Every &impl SerializeRow should also implement SerializeRow
+impl<T: SerializeRow> SerializeRow for &T {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SerializationError> {
+        <T as SerializeRow>::serialize(*self, ctx, out)
+    }
+}
+
+impl SerializeRow for SerializedValues {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SerializationError> {
+        todo!()
+    }
+}
+
+impl<'b> SerializeRow for Cow<'b, SerializedValues> {
+    fn serialize(
+        &self,
+        ctx: &RowSerializationContext<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), SerializationError> {
+        todo!()
     }
 }
