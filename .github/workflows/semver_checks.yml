@@ -7,6 +7,9 @@ on:
     branches:
     - main
     - 'branch-*'
+  push:
+    tags:
+      - v*.*.*
 
 env:
   CARGO_TERM_COLOR: always
@@ -44,3 +47,14 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         GH_REPO: ${{ github.repository }}
+
+  semver-push-tag:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      pull-requests: write
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v3
+    - name: Verify that's it's safe to publish the version.
+      run: cargo semver-checks -p scylla -p scylla-cql
