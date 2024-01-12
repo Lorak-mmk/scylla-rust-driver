@@ -86,6 +86,16 @@ There are a few scenarios:
          using command like `cargo update -p toml_datetime --precise 0.6.3` and go back to step 3.
       5. Rename `Cargo.lock` to `Cargo.lock.msrv`.
 
+### Semver checking 
+
+Our CI runs cargo semver-checks and labels PRs that introduce breaking changes.
+If you don't intend to change public API, you can perform the checks locally,
+using command `make semver-rev`. Make sure you have semver-checks installed first,
+you can install it using `cargo install cargo-semver-checks`.
+
+`make semver-rev` will check for API breaking changes using `main` branch as baseline.
+To use different branch / commit call `make semver-rev rev=BRANCH`.
+
 ## Contributing to the book
 
 The documentation book is written using [mdbook](https://github.com/rust-lang/mdBook)\

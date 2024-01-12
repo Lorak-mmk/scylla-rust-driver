@@ -46,7 +46,7 @@ jobs:
       id: semver-pr-check
       run: |
         set +e
-        cargo semver-checks -p scylla -p scylla-cql --baseline-rev "$PR_BASE"
+        make semver-rev rev="$PR_BASE"
         exitcode=$?
         echo "exitcode=$exitcode" >> $GITHUB_OUTPUT
         exit "$exitcode"
@@ -82,4 +82,4 @@ jobs:
     - name: Install semver-checks
       run: cargo install cargo-semver-checks --no-default-features
     - name: Verify that's it's safe to publish the version.
-      run: cargo semver-checks -p scylla -p scylla-cql
+      run: make semver-version
