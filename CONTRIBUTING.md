@@ -100,3 +100,13 @@ cargo build --examples
 
 mdbook test -L target/debug/deps/ docs
 ```
+
+## Semver checking 
+
+Our CI runs cargo semver-checks and labels PRs that introduce breaking changes.
+If you don't intend to change public API, you can perform the checks locally,
+using command `make semver-rev`. Make sure you have semver-checks installed first,
+you can install it using `cargo install cargo-semver-checks`.
+
+`make semver-rev` will check for API breaking changes using `main` branch as baseline.
+To use different branch / commit call `make semver-rev rev=BRANCH`.
