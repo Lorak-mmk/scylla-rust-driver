@@ -4,9 +4,12 @@ name: Semver checks
 
 on:
   pull_request_target:
+    Commented out for testing purposes
     branches:
     - main
     - 'branch-*'
+    # For testing purposes
+    - semver-checks
   push:
     tags:
       - v*.*.*
