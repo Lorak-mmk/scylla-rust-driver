@@ -1510,6 +1510,22 @@ mod test_utils {
             }
         }
     }
+
+    impl<'frame> DeserializedMetadataAndRawRows<'frame, RawRowsOwned> {
+        #[inline]
+        #[doc(hidden)]
+        pub fn new_for_test(
+            metadata: ResultMetadata<'frame>,
+            rows_count: usize,
+            raw_rows: Bytes,
+        ) -> Self {
+            Self {
+                metadata: ResultMetadataHolder::Owned(metadata),
+                rows_count,
+                raw_rows: RawRowsOwned(raw_rows),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
