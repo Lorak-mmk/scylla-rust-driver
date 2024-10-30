@@ -648,8 +648,7 @@ impl RawIterator {
         let mut s = self.as_mut();
 
         let received_page = ready_some_ok!(Pin::new(&mut s.page_receiver).poll_recv(cx));
-        let raw_rows_with_deserialized_metadata =
-            received_page.rows.deserialize_owned_metadata()?;
+        let raw_rows_with_deserialized_metadata = received_page.rows.deserialize_metadata()?;
         s.current_page = RawRowsLendingIterator::new(raw_rows_with_deserialized_metadata);
 
         if let Some(tracing_id) = received_page.tracing_id {
@@ -963,7 +962,7 @@ impl RawIterator {
         //   cancelled
         let page_received = receiver.recv().await.unwrap()?;
         let raw_rows_with_deserialized_metadata =
-            page_received.rows.deserialize_owned_metadata()?;
+            page_received.rows.deserialize_metadata()?;
 
         Ok(Self {
             current_page: RawRowsLendingIterator::new(raw_rows_with_deserialized_metadata),
