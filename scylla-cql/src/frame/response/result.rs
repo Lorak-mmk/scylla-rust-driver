@@ -698,20 +698,14 @@ pub mod metadata_container {
         pub(crate) fn make_deserialized_metadata<F, ErrorT>(
             frame: Bytes,
             deserializer: F,
-            col_count: usize,
-            global_tables_spec: bool,
         ) -> Result<(Self, Bytes), ErrorT>
         where
-            F: for<'x> FnOnce(
-                &mut FrameSlice<'x>,
-                usize,
-                bool,
-            ) -> Result<ResultMetadata<'x>, ErrorT>,
+            F: for<'x> FnOnce(&mut FrameSlice<'x>) -> Result<ResultMetadata<'x>, ErrorT>,
         {
             let metadata_with_slice: Yoke<(&'static [u8], ResultMetadata<'static>), BytesWrapper> =
                 Yoke::try_attach_to_cart(BytesWrapper { inner: frame }, |slice| {
                     let mut frame_slice = FrameSlice::new_borrowed(slice);
-                    let metadata = deserializer(&mut frame_slice, col_count, global_tables_spec)?;
+                    let metadata = deserializer(&mut frame_slice)?;
                     Ok((frame_slice.as_slice(), metadata))
                 })?;
 
@@ -1111,41 +1105,14 @@ impl RawMetadataAndRawRows {
     }
 }
 
-fn metadata_deserializer<'a>(
-    frame_slice: &mut FrameSlice<'a>,
-    col_count: usize,
-    global_tables_spec: bool,
-) -> std::result::Result<ResultMetadata<'a>, RowsParseError> {
-    let server_metadata = {
-        let global_table_spec = global_tables_spec
-            .then(|| deser_table_spec(frame_slice.as_slice_mut()))
-            .transpose()
-            .map_err(ResultMetadataParseError::from)?;
-
-        let col_specs =
-            deser_col_specs_borrowed(frame_slice.as_slice_mut(), global_table_spec, col_count)
-                .map_err(ResultMetadataParseError::from)?;
-
-        ResultMetadata {
-            col_count: col_count,
-            col_specs,
-        }
-    };
-    if server_metadata.col_count() != server_metadata.col_specs().len() {
-        return Err(RowsParseError::ColumnCountMismatch {
-            col_count: server_metadata.col_count(),
-            col_specs_count: server_metadata.col_specs().len(),
-        });
-    }
-    Ok(server_metadata)
-}
-
 impl RawMetadataAndRawRows {
     /// Deserializes ResultMetadata and deserializes rows count. Keeps rows in the serialized form.
     ///
     /// If metadata is cached (in the PreparedStatement), it is reused (shared) from cache
     /// instead of deserializing.
-    pub fn deserialize_metadata(self) -> StdResult<DeserializedMetadataAndRawRows, RowsParseError> {
+    pub fn deserialize_metadata<'a>(
+        self,
+    ) -> StdResult<DeserializedMetadataAndRawRows, RowsParseError> {
         let (metadata_deserialized, row_count_and_raw_rows) = match self.cached_metadata {
             Some(cached) if self.no_metadata => {
                 // Server sent no metadata, but we have metadata cached. This means that we asked the server
@@ -1174,12 +1141,46 @@ impl RawMetadataAndRawRows {
                 // too, because it's suspicious, so we had better use the new metadata just in case.
                 // Also, we simply need to advance the buffer pointer past metadata, and this requires
                 // parsing metadata.
+                fn get_deserializer(
+                    col_count: usize,
+                    global_tables_spec: bool,
+                ) -> impl for<'x> FnOnce(
+                    &mut FrameSlice<'x>,
+                )
+                    -> StdResult<ResultMetadata<'x>, RowsParseError> {
+                    move |frame_slice| {
+                        let server_metadata = {
+                            let global_table_spec = global_tables_spec
+                                .then(|| deser_table_spec(frame_slice.as_slice_mut()))
+                                .transpose()
+                                .map_err(ResultMetadataParseError::from)?;
+
+                            let col_specs = deser_col_specs_borrowed(
+                                frame_slice.as_slice_mut(),
+                                global_table_spec,
+                                col_count,
+                            )
+                            .map_err(ResultMetadataParseError::from)?;
+
+                            ResultMetadata {
+                                col_count: col_count,
+                                col_specs,
+                            }
+                        };
+                        if server_metadata.col_count() != server_metadata.col_specs().len() {
+                            return Err(RowsParseError::ColumnCountMismatch {
+                                col_count: server_metadata.col_count(),
+                                col_specs_count: server_metadata.col_specs().len(),
+                            });
+                        }
+                        Ok(server_metadata)
+                    }
+                }
+
                 let (metadata_container, raw_rows_with_count) =
                     metadata_container::SelfBorrowedMetataContainer::make_deserialized_metadata(
                         self.raw_metadata_and_rows,
-                        metadata_deserializer,
-                        self.col_count,
-                        self.global_tables_spec,
+                        get_deserializer(self.col_count, self.global_tables_spec),
                     )?;
                 (
                     ResultMetadataHolder::SelfBorrowed(metadata_container),
