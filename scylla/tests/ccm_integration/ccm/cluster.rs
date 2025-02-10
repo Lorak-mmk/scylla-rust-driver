@@ -221,14 +221,14 @@ impl NodeStopOptions {
 
     /// Enables or disables the `--no-wait` cmm option.
     #[allow(dead_code)]
-    pub(crate) fn no_wait(&mut self, no_wait: bool) -> &mut Self {
+    pub(crate) fn no_wait(mut self, no_wait: bool) -> Self {
         self.no_wait = no_wait;
         self
     }
 
     /// Enables or disables the `--not-gently` ccm option.
     #[allow(dead_code)]
-    pub(crate) fn not_gently(&mut self, not_gently: bool) -> &mut Self {
+    pub(crate) fn not_gently(mut self, not_gently: bool) -> Self {
         self.not_gently = not_gently;
         self
     }
