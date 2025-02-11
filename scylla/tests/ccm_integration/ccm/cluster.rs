@@ -430,7 +430,7 @@ impl NodeList {
 }
 
 pub(crate) struct Cluster {
-    pub(crate) nodes: NodeList,
+    nodes: NodeList,
     destroyed: bool,
     logged_cmd: Arc<LoggedCmd>,
     opts: ClusterOptions,
@@ -743,6 +743,10 @@ impl Cluster {
     pub(crate) async fn make_session_builder(&self) -> SessionBuilder {
         let endpoints = self.nodes.get_contact_endpoints().await;
         SessionBuilder::new().known_nodes(endpoints)
+    }
+
+    pub(crate) fn nodes(&self) -> &NodeList {
+        &self.nodes
     }
 }
 
