@@ -141,9 +141,9 @@ impl Default for NodeStartOptions {
 }
 
 impl NodeStartOptions {
-    const NO_WAIT: &str = "--no-wait";
-    const WAIT_OTHER_NOTICE: &str = "--wait-other-notice";
-    const WAIT_FOR_BINARY_PROTO: &str = "--wait-for-binary-proto";
+    const NO_WAIT: &'static str = "--no-wait";
+    const WAIT_OTHER_NOTICE: &'static str = "--wait-other-notice";
+    const WAIT_FOR_BINARY_PROTO: &'static str = "--wait-for-binary-proto";
 
     /// Creates the default start options. Enables following ccm options:
     /// - `--wait-other-notice`
@@ -188,8 +188,8 @@ pub(crate) struct NodeStopOptions {
 }
 
 impl NodeStopOptions {
-    const NO_WAIT: &str = "--no-wait";
-    const NOT_GENTLY: &str = "--not-gently";
+    const NO_WAIT: &'static str = "--no-wait";
+    const NOT_GENTLY: &'static str = "--not-gently";
 
     /// Create a new `NodeStopOptions` with default values.
     /// All ccm options are disabled by default.
@@ -420,7 +420,7 @@ impl NodeList {
                 return Some(node);
             }
         }
-        return None;
+        None
     }
 
     fn new() -> Self {
