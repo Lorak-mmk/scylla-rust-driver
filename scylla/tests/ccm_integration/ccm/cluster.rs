@@ -414,6 +414,15 @@ impl NodeList {
         self.0.iter()
     }
 
+    async fn get_by_id(&self, id: u16) -> Option<&Arc<RwLock<Node>>> {
+        for node in self.iter() {
+            if node.read().await.opts.id == id {
+                return Some(node);
+            }
+        }
+        return None;
+    }
+
     fn new() -> Self {
         NodeList(Vec::new())
     }
