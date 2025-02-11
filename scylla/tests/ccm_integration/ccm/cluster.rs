@@ -404,36 +404,14 @@ impl Node {
 
 pub(crate) struct NodeList(Vec<Arc<RwLock<Node>>>);
 
-struct NodeListIter<'a> {
-    list: &'a NodeList,
-    index: usize,
-}
-
-impl Iterator for NodeListIter<'_> {
-    type Item = Arc<RwLock<Node>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index < self.list.0.len() {
-            let node = self.list.0[self.index].clone();
-            self.index += 1;
-            Some(node)
-        } else {
-            None
-        }
-    }
-}
-
 #[allow(dead_code)]
 impl NodeList {
     fn push(&mut self, node: Arc<RwLock<Node>>) {
         self.0.push(node);
     }
 
-    fn iter(&self) -> NodeListIter {
-        NodeListIter {
-            list: self,
-            index: 0,
-        }
+    fn iter(&self) -> impl Iterator<Item = &Arc<RwLock<Node>>> {
+        self.0.iter()
     }
 
     fn new() -> Self {
