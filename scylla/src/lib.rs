@@ -273,3 +273,5 @@ pub mod internal_testing {
         )
     }
 }
+
+pub fn foo() {}
