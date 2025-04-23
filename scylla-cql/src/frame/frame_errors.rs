@@ -473,7 +473,7 @@ pub enum CqlTypeParseError {
     #[error("CQL Type not yet implemented, id: {0}")]
     TypeNotImplemented(u16),
     #[error("Failed to parse custom CQL type: {0}")]
-    CustomTypeParseError(#[from] CustomTypeParseError),
+    CustomTypeParseError(CustomTypeParseError),
 }
 
 /// A low level deserialization error.
