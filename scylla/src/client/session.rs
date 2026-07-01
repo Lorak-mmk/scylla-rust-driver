@@ -6,7 +6,11 @@ use super::pager::{PreparedPagerConfig, QueryPager};
 use super::{Compression, PoolSize, SelfIdentity, WriteCoalescingDelay};
 use crate::authentication::AuthenticatorProvider;
 use crate::client::client_routes::ClientRoutesConfig;
-use crate::cluster::node::{KnownNode, NodeRef};
+use crate::client::execution::{
+    NodeAttemptTarget, RequestExecutionParams, RequestKind, RunRequestResult,
+    run_request_no_side_effects,
+};
+use crate::cluster::node::KnownNode;
 use crate::cluster::{Cluster, ClusterNeatDebug, ClusterState};
 use crate::errors::DbError;
 use crate::errors::{
@@ -21,7 +25,6 @@ use crate::network::{
     Connection, ConnectionConfig, PoolConfig, TcpSocketOptions, VerifiedKeyspaceName,
 };
 use crate::observability::driver_tracing::RequestSpan;
-use crate::observability::history::{self, HistoryListener};
 use crate::observability::metrics::Metrics;
 use crate::observability::tracing::TracingInfo;
 use crate::policies::address_translator::AddressTranslator;
@@ -30,16 +33,14 @@ use crate::policies::load_balancing::{self, RoutingInfo};
 use crate::policies::reconnect::ExponentialReconnectPolicy;
 #[cfg(all(scylla_unstable, feature = "unstable-reconnect-policy"))]
 use crate::policies::reconnect::ReconnectPolicy;
-use crate::policies::retry::{RequestInfo, RetryDecision, RetrySession};
-use crate::policies::speculative_execution;
 use crate::policies::timestamp_generator::TimestampGenerator;
 use crate::response::query_result::{MaybeFirstRowError, QueryResult, RowsError};
 use crate::response::{
     Coordinator, NonErrorQueryResponse, PagingState, PagingStateResponse, QueryResponse,
 };
 use crate::routing::NodeLocationPreference;
+use crate::routing::ShardAwarePortRange;
 use crate::routing::partitioner::PartitionerName;
-use crate::routing::{Shard, ShardAwarePortRange};
 use crate::serialize::batch::BatchValues;
 use crate::serialize::row::{SerializeRow, SerializedValues};
 use crate::statement::batch::batch_values;
@@ -60,7 +61,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::timeout;
-use tracing::{Instrument, debug, error, trace, trace_span};
+use tracing::{Instrument, debug, error};
 use uuid::Uuid;
 
 pub(crate) const TABLET_CHANNEL_SIZE: usize = 8192;
@@ -549,11 +550,6 @@ impl SessionConfig {
     }
 }
 
-pub(crate) enum RunRequestResult<ResT> {
-    IgnoredWriteError,
-    Completed(ResT),
-}
-
 /// Represents a CQL session, which can be used to communicate
 /// with the database
 impl Session {
@@ -1010,28 +1006,15 @@ impl Session {
             RunRequestResult<NonErrorQueryResponse>,
             Coordinator,
         ) = self
-            .run_request(
+            .run_any_request(
                 statement_info,
                 &batch.config,
                 execution_profile,
-                |connection: Arc<Connection>,
-                 consistency: Consistency,
-                 execution_profile: &ExecutionProfileInner| {
-                    let serial_consistency = batch
-                        .config
-                        .serial_consistency
-                        .unwrap_or(execution_profile.serial_consistency);
-                    async move {
-                        connection
-                            .batch_with_consistency(
-                                batch,
-                                values_ref,
-                                consistency,
-                                serial_consistency,
-                            )
-                            .await
-                            .and_then(QueryResponse::into_non_error_query_response)
-                    }
+                |connection: Arc<Connection>, consistency: Consistency| async move {
+                    connection
+                        .batch_with_consistency(batch, values_ref, consistency, serial_consistency)
+                        .await
+                        .and_then(QueryResponse::into_non_error_query_response)
                 },
                 &span,
             )
@@ -1313,21 +1296,19 @@ impl Session {
 
         let span = RequestSpan::new_query(&statement.contents);
         let span_ref = &span;
+        let serial_consistency = statement
+            .config
+            .serial_consistency
+            .unwrap_or(execution_profile.serial_consistency);
         let (run_request_result, coordinator): (
             RunRequestResult<NonErrorQueryResponse>,
             Coordinator,
         ) = self
-            .run_request(
+            .run_any_request(
                 statement_info,
                 &statement.config,
                 execution_profile,
-                |connection: Arc<Connection>,
-                 consistency: Consistency,
-                 execution_profile: &ExecutionProfileInner| {
-                    let serial_consistency = statement
-                        .config
-                        .serial_consistency
-                        .unwrap_or(execution_profile.serial_consistency);
+                |connection: Arc<Connection>, consistency: Consistency| {
                     // Needed to avoid moving query and values into async move block
                     let values_ref = &values;
                     let paging_state_ref = &paging_state;
@@ -1483,7 +1464,7 @@ impl Session {
             statement,
             execution_profile,
             self.cluster.get_state(),
-            self.metrics.as_ref().clone(),
+            Arc::clone(&self.metrics),
             Arc::clone(&self.node_location_preference),
         )
         .await
@@ -1727,34 +1708,30 @@ impl Session {
             span.record_replicas(replicas)
         }
 
+        let serial_consistency = prepared
+            .config
+            .serial_consistency
+            .unwrap_or(execution_profile.serial_consistency);
         let (run_request_result, coordinator): (
             RunRequestResult<NonErrorQueryResponse>,
             Coordinator,
         ) = self
-            .run_request(
+            .run_any_request(
                 statement_info,
                 &prepared.config,
                 execution_profile,
-                |connection: Arc<Connection>,
-                 consistency: Consistency,
-                 execution_profile: &ExecutionProfileInner| {
-                    let serial_consistency = prepared
-                        .config
-                        .serial_consistency
-                        .unwrap_or(execution_profile.serial_consistency);
-                    async move {
-                        connection
-                            .execute_raw_with_consistency(
-                                prepared,
-                                serialized_values,
-                                consistency,
-                                serial_consistency,
-                                page_size,
-                                paging_state_ref.clone(),
-                            )
-                            .await
-                            .and_then(QueryResponse::into_non_error_query_response)
-                    }
+                |connection: Arc<Connection>, consistency: Consistency| async move {
+                    connection
+                        .execute_raw_with_consistency(
+                            prepared,
+                            serialized_values,
+                            consistency,
+                            serial_consistency,
+                            page_size,
+                            paging_state_ref.clone(),
+                        )
+                        .await
+                        .and_then(QueryResponse::into_non_error_query_response)
                 },
                 &span,
             )
@@ -1809,7 +1786,7 @@ impl Session {
                 values,
                 execution_profile,
                 cluster_state: self.cluster.get_state(),
-                metrics: self.metrics.as_ref().clone(),
+                metrics: Arc::clone(&self.metrics),
                 location_preference: Arc::clone(&self.node_location_preference),
             },
         )
@@ -2040,322 +2017,73 @@ impl Session {
         Ok(Some(tracing_info))
     }
 
-    /// This method allows to easily run a request using load balancing, retry policy etc.
-    /// Requires some information about the request and a closure.
-    /// The closure is used to execute the request once on a chosen connection.
-    /// - query will use connection.query()
-    /// - execute will use connection.execute()
+    /// Layer 1 of request execution: runs a request and additionally handles
+    /// the side effects (`USE <keyspace>` and schema-changing statements) that
+    /// require access to [`Session`] state.
     ///
-    /// If this closure fails with some errors, retry policy is used to perform retries.
-    /// On success, this request's result is returned.
+    /// It resolves all per-request configuration against the execution profile,
+    /// builds a load-balancing plan of [`NodeAttemptTarget`]s and delegates the
+    /// actual execution (timeout, speculative fibers, retries, history, metrics)
+    /// to [`run_request_no_side_effects`].
+    ///
+    /// The closure `run_request_once` performs a single attempt against a chosen
+    /// connection and consistency.
     // I tried to make this closures take a reference instead of an Arc but failed
     // maybe once async closures get stabilized this can be fixed
-    async fn run_request<'a, QueryFut>(
+    async fn run_any_request<'a, QueryFut>(
         &'a self,
         statement_info: RoutingInfo<'a>,
         statement_config: &'a StatementConfig,
         execution_profile: Arc<ExecutionProfileInner>,
-        run_request_once: impl Fn(Arc<Connection>, Consistency, &ExecutionProfileInner) -> QueryFut,
+        run_request_once: impl Fn(Arc<Connection>, Consistency) -> QueryFut,
         request_span: &'a RequestSpan,
     ) -> Result<(RunRequestResult<NonErrorQueryResponse>, Coordinator), ExecutionError>
     where
         QueryFut: Future<Output = Result<NonErrorQueryResponse, RequestAttemptError>>,
     {
-        let history_listener_and_id: Option<(&'a dyn HistoryListener, history::RequestId)> =
-            statement_config
-                .history_listener
-                .as_ref()
-                .map(|hl| (&**hl, hl.log_request_start()));
-
         let load_balancer = statement_config
             .load_balancing_policy
             .as_deref()
             .unwrap_or(execution_profile.load_balancing_policy.as_ref());
 
-        let runner = async {
-            let cluster_state = self.cluster.get_state();
-            let request_plan =
-                load_balancing::Plan::new(load_balancer, &statement_info, &cluster_state);
+        let retry_policy = statement_config
+            .retry_policy
+            .as_deref()
+            .unwrap_or(&*execution_profile.retry_policy);
 
-            // If a speculative execution policy is used to run request, request_plan has to be shared
-            // between different async functions. This struct helps to wrap request_plan in mutex so it
-            // can be shared safely.
-            struct SharedPlan<'a, I>
-            where
-                I: Iterator<Item = (NodeRef<'a>, Shard)>,
-            {
-                iter: std::sync::Mutex<I>,
-            }
-
-            impl<'a, I> Iterator for &SharedPlan<'a, I>
-            where
-                I: Iterator<Item = (NodeRef<'a>, Shard)>,
-            {
-                type Item = (NodeRef<'a>, Shard);
-
-                fn next(&mut self) -> Option<Self::Item> {
-                    self.iter.lock().unwrap().next()
-                }
-            }
-
-            let retry_policy = statement_config
-                .retry_policy
-                .as_deref()
-                .unwrap_or(&*execution_profile.retry_policy);
-
-            let speculative_policy = execution_profile.speculative_execution_policy.as_ref();
-
-            match speculative_policy {
-                Some(speculative) if statement_config.is_idempotent => {
-                    let shared_request_plan = SharedPlan {
-                        iter: std::sync::Mutex::new(request_plan),
-                    };
-
-                    let request_runner_generator = |is_speculative: bool| {
-                        let history_data: Option<HistoryData> = history_listener_and_id
-                            .as_ref()
-                            .map(|(history_listener, request_id)| {
-                                let speculative_id: Option<history::SpeculativeId> =
-                                    if is_speculative {
-                                        Some(
-                                            history_listener.log_new_speculative_fiber(*request_id),
-                                        )
-                                    } else {
-                                        None
-                                    };
-                                HistoryData {
-                                    listener: *history_listener,
-                                    request_id: *request_id,
-                                    speculative_id,
-                                }
-                            });
-
-                        if is_speculative {
-                            request_span.inc_speculative_executions();
-                        }
-
-                        self.run_request_speculative_fiber(
-                            &shared_request_plan,
-                            &run_request_once,
-                            &execution_profile,
-                            ExecuteRequestContext {
-                                is_idempotent: statement_config.is_idempotent,
-                                consistency_set_on_statement: statement_config.consistency,
-                                retry_session: retry_policy.new_session(),
-                                history_data,
-                                load_balancing_policy: load_balancer,
-                                query_info: &statement_info,
-                                request_span,
-                            },
-                        )
-                    };
-
-                    let context = speculative_execution::Context {
-                        #[cfg(feature = "metrics")]
-                        metrics: Arc::clone(&self.metrics),
-                    };
-
-                    speculative_execution::execute(
-                        speculative.as_ref(),
-                        &context,
-                        request_runner_generator,
-                    )
-                    .await
-                }
-                _ => {
-                    let history_data: Option<HistoryData> =
-                        history_listener_and_id
-                            .as_ref()
-                            .map(|(history_listener, request_id)| HistoryData {
-                                listener: *history_listener,
-                                request_id: *request_id,
-                                speculative_id: None,
-                            });
-                    self.run_request_speculative_fiber(
-                        request_plan,
-                        &run_request_once,
-                        &execution_profile,
-                        ExecuteRequestContext {
-                            is_idempotent: statement_config.is_idempotent,
-                            consistency_set_on_statement: statement_config.consistency,
-                            retry_session: retry_policy.new_session(),
-                            history_data,
-                            load_balancing_policy: load_balancer,
-                            query_info: &statement_info,
-                            request_span,
-                        },
-                    )
-                    .await
-                    .unwrap_or(Err(RequestError::EmptyPlan))
-                }
-            }
+        let params = RequestExecutionParams {
+            is_idempotent: statement_config.is_idempotent,
+            consistency_set_on_statement: statement_config.consistency,
+            default_consistency: execution_profile.consistency,
+            retry_policy,
+            speculative_policy: execution_profile.speculative_execution_policy.as_deref(),
+            request_timeout: statement_config
+                .request_timeout
+                .or(execution_profile.request_timeout),
+            history_listener: statement_config.history_listener.as_deref(),
+            metrics: Some(&self.metrics),
+            request_kind: RequestKind::NonPaged,
         };
 
-        let effective_timeout = statement_config
-            .request_timeout
-            .or(execution_profile.request_timeout);
-        let result = match effective_timeout {
-            Some(timeout) => tokio::time::timeout(timeout, runner).await.unwrap_or_else(
-                |_: tokio::time::error::Elapsed| {
-                    self.metrics.inc_request_timeouts();
+        let cluster_state = self.cluster.get_state();
+        let request_plan =
+            load_balancing::Plan::new(load_balancer, &statement_info, &cluster_state).map(
+                |(node, shard)| NodeAttemptTarget::new(node, shard, load_balancer, &statement_info),
+            );
 
-                    let timeout_error = RequestError::RequestTimeout(timeout);
-                    trace!(
-                        parent: request_span.span(),
-                        error = %timeout_error,
-                        "Request timed out"
-                    );
-                    Err(timeout_error)
-                },
-            ),
-            None => runner.await,
-        };
-
-        if let Some((history_listener, request_id)) = history_listener_and_id {
-            match &result {
-                Ok(_) => history_listener.log_request_success(request_id),
-                Err(e) => history_listener.log_request_error(request_id, e),
-            }
-        }
+        let outcome =
+            run_request_no_side_effects(request_plan, run_request_once, &params, request_span)
+                .await
+                .map_err(RequestError::into_execution_error)?;
 
         // Automatically handle meaningful responses.
-        if let Ok((RunRequestResult::Completed(ref response), ref coordinator)) = result {
+        if let RunRequestResult::Completed(ref response) = outcome.result {
             self.handle_set_keyspace_response(response).await?;
-            self.handle_auto_await_schema_agreement(response, coordinator.node().host_id)
+            self.handle_auto_await_schema_agreement(response, outcome.coordinator.node().host_id)
                 .await?;
         }
 
-        result.map_err(RequestError::into_execution_error)
-    }
-
-    /// Executes the closure `run_request_once`, provided the load balancing plan and some information
-    /// about the request, including retry session.
-    /// If request fails, retry session is used to perform retries.
-    ///
-    /// Returns None, if provided plan is empty.
-    async fn run_request_speculative_fiber<'a, QueryFut>(
-        &'a self,
-        request_plan: impl Iterator<Item = (NodeRef<'a>, Shard)>,
-        run_request_once: impl Fn(Arc<Connection>, Consistency, &ExecutionProfileInner) -> QueryFut,
-        execution_profile: &ExecutionProfileInner,
-        mut context: ExecuteRequestContext<'a>,
-    ) -> Option<Result<(RunRequestResult<NonErrorQueryResponse>, Coordinator), RequestError>>
-    where
-        QueryFut: Future<Output = Result<NonErrorQueryResponse, RequestAttemptError>>,
-    {
-        let mut last_error: Option<RequestError> = None;
-        let mut current_consistency: Consistency = context
-            .consistency_set_on_statement
-            .unwrap_or(execution_profile.consistency);
-
-        'nodes_in_plan: for (node, shard) in request_plan {
-            let span = trace_span!("Executing request", node = %node.address, shard = %shard);
-            'same_node_retries: loop {
-                trace!(parent: &span, "Execution started");
-                let connection = match node.connection_for_shard(shard).await {
-                    Ok(connection) => connection,
-                    Err(e) => {
-                        trace!(
-                            parent: &span,
-                            error = %e,
-                            "Choosing connection failed"
-                        );
-                        last_error = Some(e.into());
-                        // Broken connection doesn't count as a failed request, don't log in metrics
-                        continue 'nodes_in_plan;
-                    }
-                };
-                context.request_span.record_shard_id(&connection);
-
-                self.metrics.inc_total_nonpaged_queries();
-                let request_start = std::time::Instant::now();
-
-                let connect_address = connection.get_connect_address();
-                trace!(
-                    parent: &span,
-                    connection = %connect_address,
-                    "Sending"
-                );
-                let coordinator =
-                    Coordinator::new(node, node.sharder().is_some().then_some(shard), &connection);
-
-                let attempt_id: Option<history::AttemptId> =
-                    context.log_attempt_start(connect_address);
-                let request_result: Result<NonErrorQueryResponse, RequestAttemptError> =
-                    run_request_once(connection, current_consistency, execution_profile)
-                        .instrument(span.clone())
-                        .await;
-
-                let elapsed = request_start.elapsed();
-                let request_error: RequestAttemptError = match request_result {
-                    Ok(response) => {
-                        trace!(parent: &span, "Request succeeded");
-                        let _ = self.metrics.log_query_latency(elapsed.as_millis() as u64);
-                        context.log_attempt_success(&attempt_id);
-                        context.load_balancing_policy.on_request_success(
-                            context.query_info,
-                            elapsed,
-                            node,
-                        );
-                        return Some(Ok((RunRequestResult::Completed(response), coordinator)));
-                    }
-                    Err(e) => {
-                        trace!(
-                            parent: &span,
-                            last_error = %e,
-                            "Request failed"
-                        );
-                        self.metrics.inc_failed_nonpaged_queries();
-                        context.load_balancing_policy.on_request_failure(
-                            context.query_info,
-                            elapsed,
-                            node,
-                            &e,
-                        );
-                        e
-                    }
-                };
-
-                // Use retry policy to decide what to do next
-                let request_info = RequestInfo {
-                    error: &request_error,
-                    is_idempotent: context.is_idempotent,
-                    consistency: context
-                        .consistency_set_on_statement
-                        .unwrap_or(execution_profile.consistency),
-                };
-
-                let retry_decision = context.retry_session.decide_should_retry(request_info);
-                trace!(
-                    parent: &span,
-                    retry_decision = ?retry_decision
-                );
-
-                context.log_attempt_error(&attempt_id, &request_error, &retry_decision);
-
-                last_error = Some(request_error.into());
-
-                match retry_decision {
-                    RetryDecision::RetrySameTarget(new_cl) => {
-                        self.metrics.inc_retries_num();
-                        current_consistency = new_cl.unwrap_or(current_consistency);
-                        continue 'same_node_retries;
-                    }
-                    RetryDecision::RetryNextTarget(new_cl) => {
-                        self.metrics.inc_retries_num();
-                        current_consistency = new_cl.unwrap_or(current_consistency);
-                        continue 'nodes_in_plan;
-                    }
-                    RetryDecision::DontRetry => break 'nodes_in_plan,
-
-                    RetryDecision::IgnoreWriteError => {
-                        return Some(Ok((RunRequestResult::IgnoredWriteError, coordinator)));
-                    }
-                };
-            }
-        }
-
-        last_error.map(Result::Err)
+        Ok((outcome.result, outcome.coordinator))
     }
 
     /// Awaits schema agreement among all reachable nodes.
@@ -2662,66 +2390,6 @@ impl Session {
     /// by default, i.e. when an executed statement does not define its own handle.
     pub fn get_default_execution_profile_handle(&self) -> &ExecutionProfileHandle {
         &self.default_execution_profile_handle
-    }
-}
-
-struct ExecuteRequestContext<'a> {
-    is_idempotent: bool,
-    consistency_set_on_statement: Option<Consistency>,
-    retry_session: Box<dyn RetrySession>,
-    history_data: Option<HistoryData<'a>>,
-    load_balancing_policy: &'a dyn load_balancing::LoadBalancingPolicy,
-    query_info: &'a load_balancing::RoutingInfo<'a>,
-    request_span: &'a RequestSpan,
-}
-
-struct HistoryData<'a> {
-    listener: &'a dyn HistoryListener,
-    request_id: history::RequestId,
-    speculative_id: Option<history::SpeculativeId>,
-}
-
-impl ExecuteRequestContext<'_> {
-    fn log_attempt_start(&self, node_addr: SocketAddr) -> Option<history::AttemptId> {
-        self.history_data.as_ref().map(|hd| {
-            hd.listener
-                .log_attempt_start(hd.request_id, hd.speculative_id, node_addr)
-        })
-    }
-
-    fn log_attempt_success(&self, attempt_id_opt: &Option<history::AttemptId>) {
-        let attempt_id: &history::AttemptId = match attempt_id_opt {
-            Some(id) => id,
-            None => return,
-        };
-
-        let history_data: &HistoryData = match &self.history_data {
-            Some(data) => data,
-            None => return,
-        };
-
-        history_data.listener.log_attempt_success(*attempt_id);
-    }
-
-    fn log_attempt_error(
-        &self,
-        attempt_id_opt: &Option<history::AttemptId>,
-        error: &RequestAttemptError,
-        retry_decision: &RetryDecision,
-    ) {
-        let attempt_id: &history::AttemptId = match attempt_id_opt {
-            Some(id) => id,
-            None => return,
-        };
-
-        let history_data: &HistoryData = match &self.history_data {
-            Some(data) => data,
-            None => return,
-        };
-
-        history_data
-            .listener
-            .log_attempt_error(*attempt_id, error, retry_decision);
     }
 }
 

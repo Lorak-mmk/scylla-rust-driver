@@ -3,7 +3,6 @@
 //! which abstracts over page boundaries.
 
 use std::future::Future;
-use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,24 +23,29 @@ use std::result::Result;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use crate::client::execution::{
+    NodeAttemptTarget, RequestExecutionOutcome, RequestExecutionParams, RequestKind,
+    RunRequestResult, SingleConnectionTarget, run_request_no_side_effects,
+};
 use crate::client::execution_profile::ExecutionProfileInner;
 use crate::client::session::Session;
-use crate::cluster::{ClusterState, NodeRef};
+use crate::cluster::ClusterState;
 use crate::deserialize::DeserializeOwnedRow;
 use crate::errors::{PagerExecutionError, RequestAttemptError, RequestError};
 use crate::frame::response::result;
 use crate::network::Connection;
 use crate::observability::driver_tracing::RequestSpan;
-use crate::observability::history::{self, HistoryListener};
+use crate::observability::history::HistoryListener;
 use crate::observability::metrics::Metrics;
 use crate::policies::load_balancing::{self, LoadBalancingPolicy, RoutingInfo};
-use crate::policies::retry::{RequestInfo, RetryDecision, RetrySession};
+use crate::policies::retry::{FallthroughRetryPolicy, RetryPolicy};
+use crate::policies::speculative_execution::SpeculativeExecutionPolicy;
 use crate::response::query_result::ColumnSpecs;
 use crate::response::{Coordinator, NonErrorQueryResponse, QueryResponse};
-use crate::routing::{NodeLocationPreference, Shard};
+use crate::routing::NodeLocationPreference;
 use crate::statement::prepared::{PartitionKey, PartitionKeyError, PreparedStatement};
 use crate::statement::unprepared::Statement;
-use tracing::{Instrument, trace, trace_span, warn};
+use tracing::{Instrument, warn};
 use uuid::Uuid;
 
 // Like std::task::ready!, but handles the whole stack of Poll<Option<Result<>>>.
@@ -107,600 +111,202 @@ struct FirstReceivedPage {
 
 type ResultNextPage = Result<NextReceivedPage, NextPageError>;
 
-mod timeouter {
-    use std::time::Duration;
-
-    use tokio::time::Instant;
-
-    /// Encapsulation of a timeout for paging queries.
-    pub(super) struct PageQueryTimeouter {
-        timeout: Duration,
-        timeout_instant: Instant,
-    }
-
-    impl PageQueryTimeouter {
-        /// Creates a new PageQueryTimeouter with the given timeout duration,
-        /// starting from now.
-        pub(super) fn new(timeout: Duration) -> Self {
-            Self {
-                timeout,
-                timeout_instant: Instant::now() + timeout,
-            }
-        }
-
-        /// Returns the timeout duration.
-        pub(super) fn timeout_duration(&self) -> Duration {
-            self.timeout
-        }
-
-        /// Returns the instant at which the timeout will elapse.
-        ///
-        /// This can be used with `tokio::time::timeout_at`.
-        pub(super) fn deadline(&self) -> Instant {
-            self.timeout_instant
-        }
-
-        /// Resets the timeout countdown.
-        ///
-        /// This should be called right before beginning first page fetch
-        /// and after each successful page fetch.
-        pub(super) fn reset(&mut self) {
-            self.timeout_instant = Instant::now() + self.timeout;
-        }
-    }
-}
-use timeouter::PageQueryTimeouter;
-
 enum ShouldFetchMorePages {
     NoMorePages,
     MorePages {
         first_page_coordinator: Coordinator,
         first_page_connection: Arc<Connection>,
+        paging_state: PagingState,
     },
 }
 
-// PagerWorker works in the background to fetch pages
-// QueryPager receives them through a channel
-struct PagerWorker<SpanCreatorFunc> {
+/// Drives paged execution by repeatedly invoking the unified request-execution
+/// core ([`run_request_no_side_effects`]) - once per page.
+///
+/// Each page is one logical request: it goes through the full load balancing,
+/// retry, speculative-execution, history and metrics machinery, exactly like a
+/// non-paged request. The only paging-specific logic that remains here is:
+/// - injecting the current [`PagingState`] into each attempt,
+/// - "coordinator stability" (preferring the node/connection that served the
+///   previous page for the next one),
+/// - turning each successful page into a [`NextReceivedPage`] sent over the
+///   channel, and stopping once the server reports no more pages.
+struct PagingExecutor<SpanCreator> {
     load_balancing_policy: Arc<dyn LoadBalancingPolicy>,
-    query_is_idempotent: bool,
-    query_consistency: Consistency,
-    retry_session: Box<dyn RetrySession>,
-    timeouter: Option<PageQueryTimeouter>,
-    metrics: Metrics,
-
-    paging_state: PagingState,
-
+    retry_policy: Arc<dyn RetryPolicy>,
+    speculative_policy: Option<Arc<dyn SpeculativeExecutionPolicy>>,
+    request_timeout: Option<Duration>,
+    is_idempotent: bool,
+    consistency_set_on_statement: Option<Consistency>,
+    default_consistency: Consistency,
+    metrics: Arc<Metrics>,
     history_listener: Option<Arc<dyn HistoryListener>>,
-    current_request_id: Option<history::RequestId>,
-    current_attempt_id: Option<history::AttemptId>,
-
-    parent_span: tracing::Span,
-    span_creator: SpanCreatorFunc,
+    span_creator: SpanCreator,
 }
 
-impl<SpanCreator> PagerWorker<SpanCreator>
+impl<SpanCreator> PagingExecutor<SpanCreator>
 where
     SpanCreator: Fn(&Option<PartitionKey<'_>>) -> RequestSpan,
 {
-    /// Fetches remaining pages (pages 2+) in a background task.
-    /// Sends each page through the mpsc channel.
+    /// Fetches exactly one page by delegating to [`run_request_no_side_effects`].
     ///
-    /// A fresh query plan is constructed for each page, preventing plan
-    /// exhaustion for long-running multi-page queries.
-    ///
-    /// The last successful coordinator is preferred for the next page
-    /// (coordinator stability), but all other nodes remain available
-    /// for retry.
-    #[expect(clippy::too_many_arguments)]
-    async fn work<QueryFunc, QueryFut>(
-        mut self,
-        cluster_state: Arc<ClusterState>,
-        sender: mpsc::Sender<ResultNextPage>,
-        page_query: QueryFunc,
-        routing_info: RoutingInfo<'_>,
-        partition_key: Option<PartitionKey<'_>>,
-        mut last_successful_page_coordinator: Coordinator,
-        mut last_successful_page_conn: Arc<Connection>,
-    ) where
-        QueryFunc: Fn(Arc<Connection>, Consistency, PagingState) -> QueryFut,
-        QueryFut: Future<Output = Result<QueryResponse, RequestAttemptError>>,
-    {
-        let mut last_error: RequestError = RequestError::EmptyPlan;
-        let load_balancer = Arc::clone(&self.load_balancing_policy);
-
-        // Iterates over pages until exhaustion or non-retriable error.
-        'paging: loop {
-            let query_plan =
-                load_balancing::Plan::new(load_balancer.as_ref(), &routing_info, &cluster_state);
-            let mut current_consistency: Consistency = self.query_consistency;
-
-            self.timeouter.as_mut().map(PageQueryTimeouter::reset);
-
-            let parent_span = self.parent_span.clone();
-            let create_execution_span = |node: NodeRef, shard: Option<Shard>| trace_span!(parent: &parent_span, "Executing query", node = %node.address, shard = ?shard);
-
-            // Prefix the plan with the last successful coordinator (coordinator
-            // stability), then chain the remaining nodes from the fresh plan.
-            let query_plan = std::iter::once((
-                last_successful_page_coordinator.node(),
-                last_successful_page_coordinator.shard(),
-                create_execution_span(
-                    last_successful_page_coordinator.node(),
-                    last_successful_page_coordinator.shard(),
-                ),
-                itertools::Either::Left(std::future::ready(Ok(last_successful_page_conn))),
-            ))
-            .chain(
-                query_plan
-                    // We filter out the last successful page coordinator, because it's tried out first.
-                    .filter(|&(node, shard)| {
-                        !(Arc::ptr_eq(node, last_successful_page_coordinator.node())
-                            && last_successful_page_coordinator
-                                .shard()
-                                // If we targeted an unsharded node (such as Cassandra) previously,
-                                // we should now repeat it as unsharded and at the same time filter out
-                                // all targets to that node, with any shard.
-                                .is_none_or(|last_shard| last_shard == shard))
-                    })
-                    .map(|(node, shard)| {
-                        let span = create_execution_span(node, Some(shard));
-                        // For each node in the plan choose a connection to use.
-                        // This connection will be reused for same node retries to preserve paging cache on the shard.
-                        let connection_fut = itertools::Either::Right(
-                            node.connection_for_shard(shard).instrument(span.clone()),
-                        );
-                        (node, Some(shard), span, connection_fut)
-                    }),
-            );
-
-            // Iterates over nodes in the query plan, trying to fetch the next page.
-            'nodes_in_plan: for (node, shard, all_pages_span, connection_fut) in query_plan {
-                // For each node in the plan choose a connection to use
-                // This connection will be reused for same node retries to preserve paging cache on the shard
-                let connection: Arc<Connection> = match connection_fut.await {
-                    Ok(connection) => connection,
-                    Err(e) => {
-                        trace!(
-                            parent: &all_pages_span,
-                            error = %e,
-                            "Choosing connection failed"
-                        );
-                        last_error = e.into();
-                        // Broken connection doesn't count as a failed query, don't log in metrics.
-                        continue 'nodes_in_plan;
-                    }
-                };
-
-                let coordinator = Coordinator::new(node, node.sharder().and(shard), &connection);
-
-                // Retries on the same node as long as RetrySession decides so.
-                'same_node_retries: loop {
-                    trace!(parent: &all_pages_span, "Execution started");
-
-                    let request_span = (self.span_creator)(&partition_key);
-
-                    let fetch_result = self
-                        .fetch_one_page(
-                            &connection,
-                            current_consistency,
-                            &request_span,
-                            &page_query,
-                        )
-                        .instrument(request_span.span().clone())
-                        .await;
-                    let query_result = match fetch_result {
-                        Err(RequestTimeoutError(timeout)) => {
-                            last_error = RequestError::RequestTimeout(timeout);
-                            trace!(
-                                parent: &all_pages_span,
-                                error = %last_error,
-                                "Request timed out"
-                            );
-                            // This means that we failed all attempts - in this case, due to a timeout.
-                            break 'nodes_in_plan;
-                        }
-                        Ok((elapsed, result)) => {
-                            self.process_next_page(
-                                &routing_info,
-                                node,
-                                coordinator.clone(),
-                                &request_span,
-                                &sender,
-                                elapsed,
-                                result,
-                            )
-                            .await
-                        }
-                    };
-
-                    let request_error: RequestAttemptError = match query_result {
-                        Ok(ControlFlow::Break(())) => {
-                            // Successfully queried the last remaining page.
-                            trace!(parent: &all_pages_span, "Request succeeded");
-                            return;
-                        }
-                        Ok(ControlFlow::Continue(())) => {
-                            // Successfully queried one page, and there are more to fetch.
-                            // Reset the timeout_instant for the next page fetch.
-                            self.timeouter.as_mut().map(PageQueryTimeouter::reset);
-
-                            // Prioritize the successful coordinator for the next page fetch.
-                            last_successful_page_coordinator = coordinator;
-                            last_successful_page_conn = connection;
-
-                            // Continue with a fresh plan for the next page.
-                            continue 'paging;
-                        }
-                        Err(error) => {
-                            trace!(
-                                parent: &all_pages_span,
-                                error = %error,
-                                "Request failed"
-                            );
-                            error
-                        }
-                    };
-
-                    let request_info = RequestInfo {
-                        error: &request_error,
-                        is_idempotent: self.query_is_idempotent,
-                        consistency: current_consistency,
-                    };
-
-                    let retry_decision = self.retry_session.decide_should_retry(request_info);
-                    trace!(
-                        parent: &all_pages_span,
-                        retry_decision = ?retry_decision
-                    );
-
-                    self.log_attempt_error(&request_error, &retry_decision);
-
-                    last_error = request_error.into();
-
-                    match retry_decision {
-                        RetryDecision::RetrySameTarget(cl) => {
-                            self.metrics.inc_retries_num();
-                            current_consistency = cl.unwrap_or(current_consistency);
-                            continue 'same_node_retries;
-                        }
-                        RetryDecision::RetryNextTarget(cl) => {
-                            self.metrics.inc_retries_num();
-                            current_consistency = cl.unwrap_or(current_consistency);
-                            continue 'nodes_in_plan;
-                        }
-                        RetryDecision::DontRetry => break 'nodes_in_plan,
-                        RetryDecision::IgnoreWriteError => {
-                            self.log_request_success();
-                            self.retry_session.reset();
-
-                            warn!("Ignoring error during fetching pages; stopping fetching.");
-                            return;
-                        }
-                    };
-                }
-            }
-
-            // If we are here, it means we failed to fetch next page on any node from the plan.
-            // The plan is exhausted, so we send the last error and finish.
-            self.log_request_error(&last_error);
-            let _ = sender
-                .send(Err(NextPageError::RequestFailure(last_error)))
-                .await;
-            return;
-        }
-    }
-
-    /// Fetches the first page on the caller task (no spawning).
-    /// Returns the first page and whether more pages should be fetched.
-    async fn query_first_page<QueryFunc, QueryFut>(
-        &mut self,
+    /// `paging_state` is injected into each attempt. If `stability` is set, the
+    /// given coordinator/connection is tried first (and filtered out of the
+    /// fresh load balancing plan so it is not attempted twice).
+    async fn fetch_one_page<PageQuery, QueryFut>(
+        &self,
         cluster_state: &ClusterState,
-        partition_key: &Option<PartitionKey<'_>>,
         routing_info: &RoutingInfo<'_>,
-        page_query: QueryFunc,
-    ) -> Result<(FirstReceivedPage, ShouldFetchMorePages), NextPageError>
-    where
-        QueryFunc: Fn(Arc<Connection>, Consistency, PagingState) -> QueryFut,
-        QueryFut: Future<Output = Result<QueryResponse, RequestAttemptError>>,
-    {
-        let load_balancer = Arc::clone(&self.load_balancing_policy);
-        let query_plan =
-            load_balancing::Plan::new(load_balancer.as_ref(), routing_info, cluster_state);
-
-        let mut last_error: RequestError = RequestError::EmptyPlan;
-        let mut current_consistency: Consistency = self.query_consistency;
-
-        self.log_request_start();
-        self.timeouter.as_mut().map(PageQueryTimeouter::reset);
-
-        // Iterates over nodes in the query plan, trying to fetch the next page.
-        'nodes_in_plan: for (node, shard) in query_plan {
-            let all_pages_span = trace_span!(parent: &self.parent_span, "Executing query", node = %node.address, shard = %shard);
-            // For each node in the plan choose a connection to use
-            // This connection will be reused for same node retries to preserve paging cache on the shard
-            let connection: Arc<Connection> = match node
-                .connection_for_shard(shard)
-                .instrument(all_pages_span.clone())
-                .await
-            {
-                Ok(connection) => connection,
-                Err(e) => {
-                    trace!(
-                        parent: &all_pages_span,
-                        error = %e,
-                        "Choosing connection failed"
-                    );
-                    last_error = e.into();
-                    // Broken connection doesn't count as a failed query, don't log in metrics
-                    continue 'nodes_in_plan;
-                }
-            };
-
-            // Retries on the same node as long as RetrySession decides so.
-            'same_node_retries: loop {
-                trace!(parent: &all_pages_span, "Execution started");
-
-                let coordinator =
-                    Coordinator::new(node, node.sharder().is_some().then_some(shard), &connection);
-                let request_span = (self.span_creator)(partition_key);
-
-                let fetch_result = self
-                    .fetch_one_page(&connection, current_consistency, &request_span, &page_query)
-                    .instrument(request_span.span().clone())
-                    .await;
-                let query_result = match fetch_result {
-                    Err(e) => Err(e),
-                    Ok((elapsed, result)) => {
-                        let result = self
-                            .process_first_page(
-                                routing_info,
-                                node,
-                                coordinator.clone(),
-                                &request_span,
-                                elapsed,
-                                result,
-                            )
-                            .await;
-                        Ok(result)
-                    }
-                };
-
-                let request_error: RequestAttemptError = match query_result {
-                    Ok(Ok((first_page, paging_state_response))) => {
-                        trace!(parent: &all_pages_span, "Request succeeded");
-                        let should_fetch_more_pages = match paging_state_response {
-                            PagingStateResponse::HasMorePages { .. } => {
-                                ShouldFetchMorePages::MorePages {
-                                    first_page_coordinator: coordinator,
-                                    first_page_connection: connection,
-                                }
-                            }
-                            PagingStateResponse::NoMorePages => ShouldFetchMorePages::NoMorePages,
-                        };
-                        return Ok((first_page, should_fetch_more_pages));
-                    }
-                    Ok(Err(error)) => {
-                        trace!(
-                            parent: &all_pages_span,
-                            error = %error,
-                            "Request failed"
-                        );
-                        error
-                    }
-                    Err(RequestTimeoutError(timeout)) => {
-                        let request_error = RequestError::RequestTimeout(timeout);
-                        self.log_request_error(&request_error);
-                        trace!(
-                            parent: &all_pages_span,
-                            error = %request_error,
-                            "Request timed out"
-                        );
-                        // This means that we failed all attempts - in this case, due to a timeout.
-                        return Err(NextPageError::RequestFailure(request_error));
-                    }
-                };
-
-                // Use retry policy to decide what to do next
-                let request_info = RequestInfo {
-                    error: &request_error,
-                    is_idempotent: self.query_is_idempotent,
-                    consistency: current_consistency,
-                };
-
-                let retry_decision = self.retry_session.decide_should_retry(request_info);
-                trace!(
-                    parent: &all_pages_span,
-                    retry_decision = ?retry_decision
-                );
-
-                self.log_attempt_error(&request_error, &retry_decision);
-
-                last_error = RequestError::LastAttemptError(request_error);
-
-                match retry_decision {
-                    RetryDecision::RetrySameTarget(cl) => {
-                        self.metrics.inc_retries_num();
-                        current_consistency = cl.unwrap_or(current_consistency);
-                        continue 'same_node_retries;
-                    }
-                    RetryDecision::RetryNextTarget(cl) => {
-                        self.metrics.inc_retries_num();
-                        current_consistency = cl.unwrap_or(current_consistency);
-                        continue 'nodes_in_plan;
-                    }
-                    RetryDecision::DontRetry => break 'nodes_in_plan,
-                    RetryDecision::IgnoreWriteError => {
-                        self.log_request_success();
-                        self.retry_session.reset();
-
-                        warn!("Ignoring error during fetching pages; stopping fetching.");
-                        return Ok((
-                            FirstReceivedPage {
-                                content: FirstPageContent::Rows {
-                                    rows: DeserializedMetadataAndRawRows::mock_empty(),
-                                },
-                                tracing_id: None,
-                                request_coordinator: coordinator,
-                            },
-                            ShouldFetchMorePages::NoMorePages,
-                        ));
-                    }
-                };
-            }
-        }
-
-        self.log_request_error(&last_error);
-        Err(NextPageError::RequestFailure(last_error))
-    }
-
-    async fn fetch_one_page<QueryFunc, QueryFut>(
-        &mut self,
-        connection: &Arc<Connection>,
-        consistency: Consistency,
+        paging_state: &PagingState,
+        stability: Option<(&Coordinator, &Arc<Connection>)>,
+        page_query: &PageQuery,
         request_span: &RequestSpan,
-        page_query: &QueryFunc,
-    ) -> Result<(Duration, Result<NonErrorQueryResponse, RequestAttemptError>), RequestTimeoutError>
+    ) -> Result<RequestExecutionOutcome<Coordinator>, RequestError>
     where
-        QueryFunc: Fn(Arc<Connection>, Consistency, PagingState) -> QueryFut,
+        PageQuery: Fn(Arc<Connection>, Consistency, PagingState) -> QueryFut,
         QueryFut: Future<Output = Result<QueryResponse, RequestAttemptError>>,
     {
-        self.metrics.inc_total_paged_queries();
-        let query_start = std::time::Instant::now();
+        let params = RequestExecutionParams {
+            is_idempotent: self.is_idempotent,
+            consistency_set_on_statement: self.consistency_set_on_statement,
+            default_consistency: self.default_consistency,
+            retry_policy: self.retry_policy.as_ref(),
+            speculative_policy: self.speculative_policy.as_deref(),
+            request_timeout: self.request_timeout,
+            history_listener: self.history_listener.as_deref(),
+            metrics: Some(&self.metrics),
+            request_kind: RequestKind::Paged,
+        };
 
-        let connect_address = connection.get_connect_address();
-        trace!(
-            connection = %connect_address,
-            "Sending"
+        // Adapt the paging-aware `page_query` to the two-argument closure
+        // expected by the execution core, injecting the current paging state
+        // and normalizing error responses.
+        let run_request_once = move |connection: Arc<Connection>, consistency: Consistency| {
+            let paging_state = paging_state.clone();
+            async move {
+                page_query(connection, consistency, paging_state)
+                    .await
+                    .and_then(QueryResponse::into_non_error_query_response)
+            }
+        };
+
+        let load_balancing_policy = self.load_balancing_policy.as_ref();
+        let base_plan =
+            load_balancing::Plan::new(load_balancing_policy, routing_info, cluster_state);
+
+        // Coordinator stability: try the previous page's connection first.
+        let stability_target = stability.map(|(coordinator, connection)| {
+            NodeAttemptTarget::with_preselected_connection(
+                coordinator.node(),
+                coordinator.shard().unwrap_or(0),
+                Arc::clone(connection),
+                load_balancing_policy,
+                routing_info,
+            )
+        });
+
+        let plan = stability_target.into_iter().chain(
+            base_plan
+                .filter(move |&(node, shard)| match stability {
+                    // Filter out the preselected coordinator - it is tried first.
+                    // If the previous attempt targeted an unsharded node (such as
+                    // Cassandra), filter out all targets to that node regardless
+                    // of shard.
+                    Some((coordinator, _)) => {
+                        !(Arc::ptr_eq(node, coordinator.node())
+                            && coordinator
+                                .shard()
+                                .is_none_or(|last_shard| last_shard == shard))
+                    }
+                    None => true,
+                })
+                .map(move |(node, shard)| {
+                    NodeAttemptTarget::new(node, shard, load_balancing_policy, routing_info)
+                }),
         );
-        self.log_attempt_start(connect_address);
 
-        let runner = async {
-            page_query(connection.clone(), consistency, self.paging_state.clone())
-                .await
-                .and_then(QueryResponse::into_non_error_query_response)
-        };
-        let query_response = match self.timeouter {
-            Some(ref timeouter) => {
-                match tokio::time::timeout_at(timeouter.deadline(), runner).await {
-                    Ok(res) => res,
-                    Err(_) /* tokio::time::error::Elapsed */ => {
-                        self.metrics.inc_request_timeouts();
-                        return Err(RequestTimeoutError(timeouter.timeout_duration()));
-                    }
-                }
-            }
-
-            None => runner.await,
-        };
-
-        let elapsed = query_start.elapsed();
-        request_span.record_shard_id(connection);
-
-        Ok((elapsed, query_response))
+        run_request_no_side_effects(plan, run_request_once, &params, request_span).await
     }
 
-    async fn process_first_page(
-        &mut self,
-        routing_info: &RoutingInfo<'_>,
-        node: NodeRef<'_>,
-        coordinator: Coordinator,
+    /// Interprets the outcome of the first page fetch.
+    ///
+    /// The first page is special: it may legitimately be a non-Rows response
+    /// (`SetKeyspace`, `SchemaChange` or a modification statement's empty
+    /// result), which the caller turns into the appropriate session side
+    /// effects.
+    fn build_first_page(
+        &self,
+        outcome: RequestExecutionOutcome<Coordinator>,
         request_span: &RequestSpan,
-        elapsed: Duration,
-        query_response: Result<NonErrorQueryResponse, RequestAttemptError>,
-    ) -> Result<(FirstReceivedPage, PagingStateResponse), RequestAttemptError> {
-        let mut log_success = || {
-            let _ = self.metrics.log_query_latency(elapsed.as_millis() as u64);
-            self.log_attempt_success();
-            self.log_request_success();
-            self.load_balancing_policy
-                .on_request_success(routing_info, elapsed, node);
+    ) -> Result<(FirstReceivedPage, ShouldFetchMorePages), NextPageError> {
+        let coordinator = outcome.coordinator;
+        let connection = outcome.connection;
+
+        let response = match outcome.result {
+            RunRequestResult::IgnoredWriteError => {
+                warn!("Ignoring error during fetching pages; stopping fetching.");
+                return Ok((
+                    FirstReceivedPage {
+                        content: FirstPageContent::Rows {
+                            rows: DeserializedMetadataAndRawRows::mock_empty(),
+                        },
+                        tracing_id: None,
+                        request_coordinator: coordinator,
+                    },
+                    ShouldFetchMorePages::NoMorePages,
+                ));
+            }
+            RunRequestResult::Completed(response) => response,
         };
 
-        match query_response {
-            Ok(NonErrorQueryResponse {
-                response:
-                    NonErrorResponseWithDeserializedMetadata::Result(
-                        result::ResultWithDeserializedMetadata::Rows((rows, paging_state_response)),
-                    ),
-                tracing_id,
-                ..
-            }) => {
-                log_success();
+        let tracing_id = response.tracing_id;
+        match response.response {
+            NonErrorResponseWithDeserializedMetadata::Result(
+                result::ResultWithDeserializedMetadata::Rows((rows, paging_state_response)),
+            ) => {
                 request_span.record_raw_rows_fields(&rows);
-
-                if let PagingStateResponse::HasMorePages { state } = &paging_state_response {
-                    self.paging_state = state.clone();
-                    // Log the next page fetch in advance.
-                    self.log_request_start();
-                }
-
-                // Query succeeded, reset retry policy for future retries
-                self.retry_session.reset();
-
+                let should_fetch_more_pages = match paging_state_response {
+                    PagingStateResponse::HasMorePages { state } => {
+                        ShouldFetchMorePages::MorePages {
+                            first_page_coordinator: coordinator.clone(),
+                            first_page_connection: connection,
+                            paging_state: state,
+                        }
+                    }
+                    PagingStateResponse::NoMorePages => ShouldFetchMorePages::NoMorePages,
+                };
                 Ok((
                     FirstReceivedPage {
                         content: FirstPageContent::Rows { rows },
                         tracing_id,
                         request_coordinator: coordinator,
                     },
-                    paging_state_response,
+                    should_fetch_more_pages,
                 ))
             }
-            Err(err) => {
-                self.metrics.inc_failed_paged_queries();
-                self.load_balancing_policy
-                    .on_request_failure(routing_info, elapsed, node, &err);
-                Err(err)
-            }
-            Ok(NonErrorQueryResponse {
-                response:
-                    NonErrorResponseWithDeserializedMetadata::Result(
-                        result::ResultWithDeserializedMetadata::SetKeyspace(set_keyspace),
-                    ),
-                tracing_id,
-                ..
-            }) => {
-                log_success();
-
-                Ok((
-                    FirstReceivedPage {
-                        content: FirstPageContent::SetKeyspace { set_keyspace },
-                        tracing_id,
-                        request_coordinator: coordinator,
-                    },
-                    PagingStateResponse::NoMorePages,
-                ))
-            }
-            Ok(NonErrorQueryResponse {
-                response:
-                    NonErrorResponseWithDeserializedMetadata::Result(
-                        result::ResultWithDeserializedMetadata::SchemaChange(schema_change),
-                    ),
-                tracing_id,
-                ..
-            }) => {
-                log_success();
-
-                Ok((
-                    FirstReceivedPage {
-                        content: FirstPageContent::SchemaChange { schema_change },
-                        tracing_id,
-                        request_coordinator: coordinator,
-                    },
-                    PagingStateResponse::NoMorePages,
-                ))
-            }
-            Ok(NonErrorQueryResponse {
-                response: NonErrorResponseWithDeserializedMetadata::Result(_),
-                tracing_id,
-                ..
-            }) => {
-                // We have most probably sent a modification statement (e.g. INSERT or UPDATE),
-                // so let's return an empty stream as suggested in #631.
-
-                log_success();
-
+            NonErrorResponseWithDeserializedMetadata::Result(
+                result::ResultWithDeserializedMetadata::SetKeyspace(set_keyspace),
+            ) => Ok((
+                FirstReceivedPage {
+                    content: FirstPageContent::SetKeyspace { set_keyspace },
+                    tracing_id,
+                    request_coordinator: coordinator,
+                },
+                ShouldFetchMorePages::NoMorePages,
+            )),
+            NonErrorResponseWithDeserializedMetadata::Result(
+                result::ResultWithDeserializedMetadata::SchemaChange(schema_change),
+            ) => Ok((
+                FirstReceivedPage {
+                    content: FirstPageContent::SchemaChange { schema_change },
+                    tracing_id,
+                    request_coordinator: coordinator,
+                },
+                ShouldFetchMorePages::NoMorePages,
+            )),
+            NonErrorResponseWithDeserializedMetadata::Result(_) => {
+                // We have most probably sent a modification statement (e.g. INSERT
+                // or UPDATE), so let's return an empty stream as suggested in #631.
                 Ok((
                     FirstReceivedPage {
                         content: FirstPageContent::Rows {
@@ -709,280 +315,267 @@ where
                         tracing_id,
                         request_coordinator: coordinator,
                     },
-                    PagingStateResponse::NoMorePages,
+                    ShouldFetchMorePages::NoMorePages,
                 ))
             }
-            Ok(response) => {
-                self.metrics.inc_failed_paged_queries();
-                let err =
-                    RequestAttemptError::UnexpectedResponse(response.response.to_response_kind());
-                self.load_balancing_policy
-                    .on_request_failure(routing_info, elapsed, node, &err);
-                Err(err)
-            }
+            // A non-Result response. The request "succeeded" at the protocol
+            // level, but we cannot interpret it as a page.
+            other => Err(NextPageError::RequestFailure(
+                RequestError::LastAttemptError(RequestAttemptError::UnexpectedResponse(
+                    other.to_response_kind(),
+                )),
+            )),
         }
     }
 
+    /// Fetches pages 2.. in a background task, sending each over `sender`.
+    ///
+    /// A fresh plan is built for every page (preventing plan exhaustion on
+    /// long-running queries), with the previous page's coordinator preferred.
     #[expect(clippy::too_many_arguments)]
-    async fn process_next_page(
-        &mut self,
-        routing_info: &RoutingInfo<'_>,
-        node: NodeRef<'_>,
-        coordinator: Coordinator,
-        request_span: &RequestSpan,
-        sender: &mpsc::Sender<ResultNextPage>,
-        elapsed: Duration,
-        query_response: Result<NonErrorQueryResponse, RequestAttemptError>,
-    ) -> Result<ControlFlow<(), ()>, RequestAttemptError> {
-        match query_response {
-            Ok(NonErrorQueryResponse {
-                response:
-                    NonErrorResponseWithDeserializedMetadata::Result(
-                        result::ResultWithDeserializedMetadata::Rows((rows, paging_state_response)),
-                    ),
-                tracing_id,
-                ..
-            }) => {
-                let _ = self.metrics.log_query_latency(elapsed.as_millis() as u64);
-                self.log_attempt_success();
-                self.log_request_success();
-                self.load_balancing_policy
-                    .on_request_success(routing_info, elapsed, node);
-
-                request_span.record_raw_rows_fields(&rows);
-
-                let received_page = NextReceivedPage {
-                    rows,
-                    tracing_id,
-                    request_coordinator: Some(coordinator),
-                };
-
-                // Send next page to QueryPager
-                let res = sender.send(Ok(received_page)).await;
-                if res.is_err() {
-                    // channel was closed, QueryPager was dropped - should shutdown
-                    return Ok(ControlFlow::Break(()));
-                }
-
-                match paging_state_response.into_paging_control_flow() {
-                    ControlFlow::Continue(paging_state) => {
-                        self.paging_state = paging_state;
-                    }
-                    ControlFlow::Break(()) => {
-                        // Reached the last query, shutdown
-                        return Ok(ControlFlow::Break(()));
-                    }
-                }
-
-                // Query succeeded, reset retry policy for future retries
-                self.retry_session.reset();
-                self.log_request_start();
-
-                Ok(ControlFlow::Continue(()))
-            }
-            // This catches all other kinds of responses that are not rows.
-            // As this is not the first page, this is certainly an error.
-            Ok(response) => {
-                self.metrics.inc_failed_paged_queries();
-                let err =
-                    RequestAttemptError::UnexpectedResponse(response.response.to_response_kind());
-                self.load_balancing_policy
-                    .on_request_failure(routing_info, elapsed, node, &err);
-                Err(err)
-            }
-            Err(err) => {
-                self.metrics.inc_failed_paged_queries();
-                self.load_balancing_policy
-                    .on_request_failure(routing_info, elapsed, node, &err);
-                Err(err)
-            }
-        }
-    }
-
-    fn log_request_start(&mut self) {
-        let history_listener: &dyn HistoryListener = match &self.history_listener {
-            Some(hl) => &**hl,
-            None => return,
-        };
-
-        self.current_request_id = Some(history_listener.log_request_start());
-    }
-
-    fn log_request_success(&mut self) {
-        let history_listener: &dyn HistoryListener = match &self.history_listener {
-            Some(hl) => &**hl,
-            None => return,
-        };
-
-        let request_id: history::RequestId = match &self.current_request_id {
-            Some(id) => *id,
-            None => return,
-        };
-
-        history_listener.log_request_success(request_id);
-    }
-
-    fn log_request_error(&mut self, error: &RequestError) {
-        let history_listener: &dyn HistoryListener = match &self.history_listener {
-            Some(hl) => &**hl,
-            None => return,
-        };
-
-        let request_id: history::RequestId = match &self.current_request_id {
-            Some(id) => *id,
-            None => return,
-        };
-
-        history_listener.log_request_error(request_id, error);
-    }
-
-    fn log_attempt_start(&mut self, node_addr: SocketAddr) {
-        let history_listener: &dyn HistoryListener = match &self.history_listener {
-            Some(hl) => &**hl,
-            None => return,
-        };
-
-        let request_id: history::RequestId = match &self.current_request_id {
-            Some(id) => *id,
-            None => return,
-        };
-
-        self.current_attempt_id =
-            Some(history_listener.log_attempt_start(request_id, None, node_addr));
-    }
-
-    fn log_attempt_success(&mut self) {
-        let history_listener: &dyn HistoryListener = match &self.history_listener {
-            Some(hl) => &**hl,
-            None => return,
-        };
-
-        let attempt_id: history::AttemptId = match &self.current_attempt_id {
-            Some(id) => *id,
-            None => return,
-        };
-
-        history_listener.log_attempt_success(attempt_id);
-    }
-
-    fn log_attempt_error(&mut self, error: &RequestAttemptError, retry_decision: &RetryDecision) {
-        let history_listener: &dyn HistoryListener = match &self.history_listener {
-            Some(hl) => &**hl,
-            None => return,
-        };
-
-        let attempt_id: history::AttemptId = match &self.current_attempt_id {
-            Some(id) => *id,
-            None => return,
-        };
-
-        history_listener.log_attempt_error(attempt_id, error, retry_decision);
-    }
-}
-
-/// A massively simplified version of the PagerWorker. It does not have
-/// any complicated logic related to retries, it just fetches pages from
-/// a single connection.
-///
-/// NOTE: This worker only supports executing SELECT statements.
-/// More specifically, it expects that each response is of Rows kind.
-/// Other kinds of responses will result in an error.
-struct SingleConnectionPagerWorker<Fetcher> {
-    fetcher: Fetcher,
-    timeout: Option<Duration>,
-}
-
-impl<Fetcher> SingleConnectionPagerWorker<Fetcher>
-where
-    Fetcher: AsyncFn(PagingState) -> Result<QueryResponse, RequestAttemptError> + Send + Sync,
-{
-    /// Fetches a single page. Returns the page and paging state response.
-    async fn query_one_page(
-        &mut self,
-        paging_state: PagingState,
-    ) -> Result<
-        Result<(NextReceivedPage, PagingStateResponse), RequestAttemptError>,
-        RequestTimeoutError,
-    > {
-        let runner = async {
-            (self.fetcher)(paging_state)
-                .await
-                .and_then(QueryResponse::into_non_error_query_response)
-        };
-        let response_res = match self.timeout {
-            Some(timeout) => {
-                match tokio::time::timeout(timeout, runner).await {
-                    Ok(res) => res,
-                    Err(_) /* tokio::time::error::Elapsed */ => {
-                        return Err(RequestTimeoutError(timeout));
-                    }
-                }
-            }
-            None => runner.await,
-        };
-        let response = match response_res {
-            Ok(resp) => resp,
-            Err(err) => {
-                return Ok(Err(err));
-            }
-        };
-
-        match response.response {
-            NonErrorResponseWithDeserializedMetadata::Result(
-                result::ResultWithDeserializedMetadata::Rows((rows, paging_state_response)),
-            ) => {
-                let page = NextReceivedPage {
-                    rows,
-                    tracing_id: response.tracing_id,
-                    request_coordinator: None,
-                };
-                Ok(Ok((page, paging_state_response)))
-            }
-            _ => Ok(Err(RequestAttemptError::UnexpectedResponse(
-                response.response.to_response_kind(),
-            ))),
-        }
-    }
-
-    /// Fetches remaining pages (pages 2+) and sends them through the channel.
-    async fn work(mut self, paging_state: PagingState, sender: mpsc::Sender<ResultNextPage>) {
-        let mut paging_state = paging_state;
+    async fn fetch_remaining_pages<PageQuery, QueryFut>(
+        self,
+        cluster_state: Arc<ClusterState>,
+        routing_info: RoutingInfo<'_>,
+        partition_key: Option<PartitionKey<'_>>,
+        mut paging_state: PagingState,
+        mut last_coordinator: Coordinator,
+        mut last_connection: Arc<Connection>,
+        page_query: PageQuery,
+        sender: mpsc::Sender<ResultNextPage>,
+    ) where
+        PageQuery: Fn(Arc<Connection>, Consistency, PagingState) -> QueryFut,
+        QueryFut: Future<Output = Result<QueryResponse, RequestAttemptError>>,
+    {
         loop {
-            let result = self.query_one_page(paging_state).await;
-            match result {
-                Err(RequestTimeoutError(timeout)) => {
-                    let _ = sender
-                        .send(Err(NextPageError::RequestFailure(
-                            RequestError::RequestTimeout(timeout),
-                        )))
-                        .await;
+            let request_span = (self.span_creator)(&partition_key);
+            let outcome = self
+                .fetch_one_page(
+                    &cluster_state,
+                    &routing_info,
+                    &paging_state,
+                    Some((&last_coordinator, &last_connection)),
+                    &page_query,
+                    &request_span,
+                )
+                .instrument(request_span.span().clone())
+                .await;
+
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _ = sender.send(Err(NextPageError::RequestFailure(error))).await;
                     return;
                 }
-                Ok(Err(err)) => {
-                    let _ = sender
-                        .send(Err(NextPageError::RequestFailure(
-                            RequestError::LastAttemptError(err),
-                        )))
-                        .await;
+            };
+
+            let coordinator = outcome.coordinator;
+            let connection = outcome.connection;
+
+            let response = match outcome.result {
+                RunRequestResult::IgnoredWriteError => {
+                    warn!("Ignoring error during fetching pages; stopping fetching.");
                     return;
                 }
-                Ok(Ok((page, paging_state_response))) => {
-                    let send_result = sender.send(Ok(page)).await;
-                    if send_result.is_err() {
-                        // channel was closed, QueryPager was dropped - should shutdown
+                RunRequestResult::Completed(response) => response,
+            };
+
+            let tracing_id = response.tracing_id;
+            match response.response {
+                NonErrorResponseWithDeserializedMetadata::Result(
+                    result::ResultWithDeserializedMetadata::Rows((rows, paging_state_response)),
+                ) => {
+                    request_span.record_raw_rows_fields(&rows);
+
+                    let received_page = NextReceivedPage {
+                        rows,
+                        tracing_id,
+                        request_coordinator: Some(coordinator.clone()),
+                    };
+
+                    if sender.send(Ok(received_page)).await.is_err() {
+                        // Channel was closed, QueryPager was dropped - should shutdown.
                         return;
                     }
 
                     match paging_state_response.into_paging_control_flow() {
                         ControlFlow::Continue(new_paging_state) => {
                             paging_state = new_paging_state;
+                            // Prioritize this coordinator for the next page fetch.
+                            last_coordinator = coordinator;
+                            last_connection = connection;
                         }
                         ControlFlow::Break(()) => {
-                            // Reached the last query, shutdown
+                            // Reached the last page, shutdown.
                             return;
                         }
                     }
                 }
+                // This catches all other kinds of responses that are not rows.
+                // As this is not the first page, this is certainly an error.
+                other => {
+                    let error = RequestAttemptError::UnexpectedResponse(other.to_response_kind());
+                    let _ = sender
+                        .send(Err(NextPageError::RequestFailure(
+                            RequestError::LastAttemptError(error),
+                        )))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Drives paged execution over a single fixed connection, used by
+/// [`Connection::execute_iter`](crate::network::Connection::execute_iter).
+///
+/// Unlike [`PagingExecutor`], it has no load balancing, retries, speculative
+/// execution, metrics or history: it simply sends each page on the given
+/// connection through the unified execution core (via
+/// [`SingleConnectionTarget`]), applying the client-side timeout.
+///
+/// NOTE: This executor only supports executing SELECT statements. More
+/// specifically, it expects that each response is of Rows kind. Other kinds of
+/// responses will result in an error.
+struct ConnectionPagingExecutor {
+    connection: Arc<Connection>,
+    prepared: PreparedStatement,
+    values: SerializedValues,
+    page_size: crate::statement::PageSize,
+    consistency: Consistency,
+    serial_consistency: Option<SerialConsistency>,
+    request_timeout: Option<Duration>,
+}
+
+impl ConnectionPagingExecutor {
+    /// Fetches exactly one page from the fixed connection by delegating to
+    /// [`run_request_no_side_effects`] with a single-connection plan.
+    async fn fetch_one_page(
+        &self,
+        paging_state: &PagingState,
+        request_span: &RequestSpan,
+    ) -> Result<RequestExecutionOutcome<()>, RequestError> {
+        // The control-connection-style path never retries: a fallthrough retry
+        // policy makes every attempt terminal.
+        let retry_policy = FallthroughRetryPolicy::new();
+        let params = RequestExecutionParams {
+            is_idempotent: false,
+            consistency_set_on_statement: None,
+            default_consistency: self.consistency,
+            retry_policy: &retry_policy,
+            speculative_policy: None,
+            request_timeout: self.request_timeout,
+            history_listener: None,
+            metrics: None,
+            request_kind: RequestKind::Paged,
+        };
+
+        let run_request_once = |connection: Arc<Connection>, consistency: Consistency| {
+            let paging_state = paging_state.clone();
+            async move {
+                connection
+                    .execute_raw_with_consistency(
+                        &self.prepared,
+                        &self.values,
+                        consistency,
+                        self.serial_consistency,
+                        Some(self.page_size),
+                        paging_state,
+                    )
+                    .await
+                    .and_then(QueryResponse::into_non_error_query_response)
+            }
+        };
+
+        let plan = std::iter::once(SingleConnectionTarget::new(Arc::clone(&self.connection)));
+
+        run_request_no_side_effects(plan, run_request_once, &params, request_span).await
+    }
+
+    /// Interprets a page outcome. Only Rows responses are valid here.
+    fn page_from_outcome(
+        outcome: RequestExecutionOutcome<()>,
+    ) -> Result<(NextReceivedPage, PagingStateResponse), NextPageError> {
+        let response = match outcome.result {
+            // A fallthrough retry policy never ignores write errors, so this
+            // arm is effectively unreachable; end the stream gracefully.
+            RunRequestResult::IgnoredWriteError => {
+                return Ok((
+                    NextReceivedPage {
+                        rows: DeserializedMetadataAndRawRows::mock_empty(),
+                        tracing_id: None,
+                        request_coordinator: None,
+                    },
+                    PagingStateResponse::NoMorePages,
+                ));
+            }
+            RunRequestResult::Completed(response) => response,
+        };
+
+        let tracing_id = response.tracing_id;
+        match response.response {
+            NonErrorResponseWithDeserializedMetadata::Result(
+                result::ResultWithDeserializedMetadata::Rows((rows, paging_state_response)),
+            ) => Ok((
+                NextReceivedPage {
+                    rows,
+                    tracing_id,
+                    request_coordinator: None,
+                },
+                paging_state_response,
+            )),
+            other => Err(NextPageError::RequestFailure(
+                RequestError::LastAttemptError(RequestAttemptError::UnexpectedResponse(
+                    other.to_response_kind(),
+                )),
+            )),
+        }
+    }
+
+    fn make_span(&self) -> RequestSpan {
+        let span = RequestSpan::new_query(self.prepared.get_statement());
+        span.record_request_size(0);
+        span
+    }
+
+    /// Fetches pages 2.. in a background task, sending each over `sender`.
+    async fn fetch_remaining_pages(
+        self,
+        mut paging_state: PagingState,
+        sender: mpsc::Sender<ResultNextPage>,
+    ) {
+        loop {
+            let request_span = self.make_span();
+            let outcome = self
+                .fetch_one_page(&paging_state, &request_span)
+                .instrument(request_span.span().clone())
+                .await;
+
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _ = sender.send(Err(NextPageError::RequestFailure(error))).await;
+                    return;
+                }
+            };
+
+            let (page, paging_state_response) = match Self::page_from_outcome(outcome) {
+                Ok(page) => page,
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
+            };
+
+            if sender.send(Ok(page)).await.is_err() {
+                // Channel was closed, QueryPager was dropped - should shutdown.
+                return;
+            }
+
+            match paging_state_response.into_paging_control_flow() {
+                ControlFlow::Continue(new_paging_state) => paging_state = new_paging_state,
+                ControlFlow::Break(()) => return,
             }
         }
     }
@@ -993,7 +586,7 @@ pub(crate) struct PreparedPagerConfig {
     pub(crate) values: SerializedValues,
     pub(crate) execution_profile: Arc<ExecutionProfileInner>,
     pub(crate) cluster_state: Arc<ClusterState>,
-    pub(crate) metrics: Metrics,
+    pub(crate) metrics: Arc<Metrics>,
     pub(crate) location_preference: Arc<NodeLocationPreference>,
 }
 
@@ -1123,7 +716,7 @@ If you are using this API, you are probably doing something wrong."
         statement: Statement,
         execution_profile: Arc<ExecutionProfileInner>,
         cluster_state: Arc<ClusterState>,
-        metrics: Metrics,
+        metrics: Arc<Metrics>,
         node_location_preference: Arc<NodeLocationPreference>,
     ) -> Result<Self, PagerExecutionError> {
         let consistency = statement
@@ -1135,10 +728,9 @@ If you are using this API, you are probably doing something wrong."
             .serial_consistency
             .unwrap_or(execution_profile.serial_consistency);
 
-        let timeouter = statement
+        let request_timeout = statement
             .get_request_timeout()
-            .or(execution_profile.request_timeout)
-            .map(PageQueryTimeouter::new);
+            .or(execution_profile.request_timeout);
 
         let page_size = statement.get_validated_page_size();
 
@@ -1148,30 +740,13 @@ If you are using this API, you are probably doing something wrong."
                 .unwrap_or(&execution_profile.load_balancing_policy),
         );
 
-        let retry_session = statement
-            .get_retry_policy()
-            .map(|rp| &**rp)
-            .unwrap_or(&*execution_profile.retry_policy)
-            .new_session();
+        let retry_policy = Arc::clone(
+            statement
+                .get_retry_policy()
+                .unwrap_or(&execution_profile.retry_policy),
+        );
 
-        let parent_span = tracing::Span::current();
-
-        let statement_ref = &statement;
-        let page_query = |connection: Arc<Connection>,
-                          consistency: Consistency,
-                          paging_state: PagingState| {
-            async move {
-                connection
-                    .query_raw_with_consistency(
-                        statement_ref,
-                        consistency,
-                        serial_consistency,
-                        Some(page_size),
-                        paging_state,
-                    )
-                    .await
-            }
-        };
+        let speculative_policy = execution_profile.speculative_execution_policy.clone();
 
         let routing_info = RoutingInfo {
             consistency,
@@ -1189,24 +764,52 @@ If you are using this API, you are probably doing something wrong."
             span
         };
 
-        let mut worker = PagerWorker {
-            query_is_idempotent: statement.config.is_idempotent,
-            query_consistency: consistency,
+        let executor = PagingExecutor {
             load_balancing_policy,
-            retry_session,
-            timeouter,
+            retry_policy,
+            speculative_policy,
+            request_timeout,
+            is_idempotent: statement.config.is_idempotent,
+            consistency_set_on_statement: statement.config.consistency,
+            default_consistency: execution_profile.consistency,
             metrics,
-            paging_state: PagingState::start(),
             history_listener: statement.config.history_listener.as_ref().map(Arc::clone),
-            current_request_id: None,
-            current_attempt_id: None,
-            parent_span,
             span_creator,
         };
 
-        let (first_page, should_fetch_more_pages) = worker
-            .query_first_page(&cluster_state, &None, &routing_info, page_query)
-            .await?;
+        // Fetch the first page on the caller task (no spawning). The borrow of
+        // `statement` ends with this block, so it can be moved into the task.
+        let (first_page, should_fetch_more_pages) = {
+            let statement_ref = &statement;
+            let page_query = |connection: Arc<Connection>,
+                              consistency: Consistency,
+                              paging_state: PagingState| async move {
+                connection
+                    .query_raw_with_consistency(
+                        statement_ref,
+                        consistency,
+                        serial_consistency,
+                        Some(page_size),
+                        paging_state,
+                    )
+                    .await
+            };
+
+            let request_span = (executor.span_creator)(&None);
+            let outcome = executor
+                .fetch_one_page(
+                    &cluster_state,
+                    &routing_info,
+                    &PagingState::start(),
+                    None,
+                    &page_query,
+                    &request_span,
+                )
+                .instrument(request_span.span().clone())
+                .await
+                .map_err(NextPageError::RequestFailure)?;
+            executor.build_first_page(outcome, &request_span)?
+        };
 
         /* PROCESS FIRST PAGE */
         let (sender, receiver) = mpsc::channel::<ResultNextPage>(1);
@@ -1218,8 +821,10 @@ If you are using this API, you are probably doing something wrong."
             ShouldFetchMorePages::MorePages {
                 first_page_coordinator,
                 first_page_connection,
+                paging_state,
             } => {
                 /* REMAINING PAGES */
+                let parent_span = tracing::Span::current();
                 let worker_task = async move {
                     let routing_info = RoutingInfo {
                         consistency,
@@ -1246,18 +851,20 @@ If you are using this API, you are probably doing something wrong."
                                 .await
                         };
 
-                    worker
-                        .work(
+                    executor
+                        .fetch_remaining_pages(
                             cluster_state,
-                            sender,
-                            page_query,
                             routing_info,
                             None,
+                            paging_state,
                             first_page_coordinator,
                             first_page_connection,
+                            page_query,
+                            sender,
                         )
                         .await;
-                };
+                }
+                .instrument(parent_span);
                 let _worker_handle = tokio::task::spawn(worker_task);
             }
         }
@@ -1280,11 +887,10 @@ If you are using this API, you are probably doing something wrong."
             .serial_consistency
             .unwrap_or(config.execution_profile.serial_consistency);
 
-        let timeouter = config
+        let request_timeout = config
             .prepared
             .get_request_timeout()
-            .or(config.execution_profile.request_timeout)
-            .map(PageQueryTimeouter::new);
+            .or(config.execution_profile.request_timeout);
 
         let page_size = config.prepared.get_validated_page_size();
 
@@ -1295,14 +901,17 @@ If you are using this API, you are probably doing something wrong."
                 .unwrap_or(&config.execution_profile.load_balancing_policy),
         );
 
-        let retry_session = config
-            .prepared
-            .get_retry_policy()
-            .map(|rp| &**rp)
-            .unwrap_or(&*config.execution_profile.retry_policy)
-            .new_session();
+        let retry_policy = Arc::clone(
+            config
+                .prepared
+                .get_retry_policy()
+                .unwrap_or(&config.execution_profile.retry_policy),
+        );
 
-        let parent_span = tracing::Span::current();
+        let speculative_policy = config
+            .execution_profile
+            .speculative_execution_policy
+            .clone();
 
         let (partition_key, token) =
             match config.prepared.extract_partition_key_and_calculate_token(
@@ -1325,23 +934,6 @@ If you are using this API, you are probably doing something wrong."
             table: table_spec,
             is_confirmed_lwt: config.prepared.is_confirmed_lwt(),
             node_location_preference: &config.location_preference,
-        };
-
-        let prepared_ref = &config.prepared;
-        let values_ref = &config.values;
-        let page_query = |connection: Arc<Connection>,
-                          consistency: Consistency,
-                          paging_state: PagingState| async move {
-            connection
-                .execute_raw_with_consistency(
-                    prepared_ref,
-                    values_ref,
-                    consistency,
-                    serial_consistency,
-                    Some(page_size),
-                    paging_state,
-                )
-                .await
         };
 
         let serialized_values_size = config.values.buffer_size();
@@ -1371,34 +963,59 @@ If you are using this API, you are probably doing something wrong."
             span
         };
 
-        let mut worker = PagerWorker {
-            query_is_idempotent: config.prepared.config.is_idempotent,
-            query_consistency: consistency,
+        let executor = PagingExecutor {
             load_balancing_policy,
-            retry_session,
-            timeouter,
+            retry_policy,
+            speculative_policy,
+            request_timeout,
+            is_idempotent: config.prepared.config.is_idempotent,
+            consistency_set_on_statement: config.prepared.config.consistency,
+            default_consistency: config.execution_profile.consistency,
             metrics: config.metrics,
-            paging_state: PagingState::start(),
             history_listener: config
                 .prepared
                 .config
                 .history_listener
                 .as_ref()
                 .map(Arc::clone),
-            current_request_id: None,
-            current_attempt_id: None,
-            parent_span,
             span_creator,
         };
 
-        let (first_page, should_fetch_more_pages) = worker
-            .query_first_page(
-                &config.cluster_state,
-                &partition_key,
-                &routing_info,
-                page_query,
-            )
-            .await?;
+        // Fetch the first page on the caller task (no spawning). The borrows of
+        // `config.prepared`/`config.values`/`partition_key` end with this block.
+        let (first_page, should_fetch_more_pages) = {
+            let prepared_ref = &config.prepared;
+            let values_ref = &config.values;
+            let page_query = |connection: Arc<Connection>,
+                              consistency: Consistency,
+                              paging_state: PagingState| async move {
+                connection
+                    .execute_raw_with_consistency(
+                        prepared_ref,
+                        values_ref,
+                        consistency,
+                        serial_consistency,
+                        Some(page_size),
+                        paging_state,
+                    )
+                    .await
+            };
+
+            let request_span = (executor.span_creator)(&partition_key);
+            let outcome = executor
+                .fetch_one_page(
+                    &config.cluster_state,
+                    &routing_info,
+                    &PagingState::start(),
+                    None,
+                    &page_query,
+                    &request_span,
+                )
+                .instrument(request_span.span().clone())
+                .await
+                .map_err(NextPageError::RequestFailure)?;
+            executor.build_first_page(outcome, &request_span)?
+        };
 
         // Required to end the borrow of `partition_key`, so `config` can be moved into the worker task.
         std::mem::drop(partition_key);
@@ -1413,8 +1030,10 @@ If you are using this API, you are probably doing something wrong."
             ShouldFetchMorePages::MorePages {
                 first_page_coordinator,
                 first_page_connection,
+                paging_state,
             } => {
                 /* REMAINING PAGES */
+                let parent_span = tracing::Span::current();
                 let worker_task = async move {
                     let partition_key = if config.prepared.is_token_aware() {
                         match config.prepared.extract_partition_key(&config.values) {
@@ -1460,18 +1079,20 @@ If you are using this API, you are probably doing something wrong."
                                 .await
                         };
 
-                    worker
-                        .work(
+                    executor
+                        .fetch_remaining_pages(
                             config.cluster_state,
-                            sender,
-                            page_query,
                             routing_info,
                             partition_key,
+                            paging_state,
                             first_page_coordinator,
                             first_page_connection,
+                            page_query,
+                            sender,
                         )
                         .await;
-                };
+                }
+                .instrument(parent_span);
                 let _worker_handle = tokio::task::spawn(worker_task);
             }
         };
@@ -1487,38 +1108,32 @@ If you are using this API, you are probably doing something wrong."
         serial_consistency: Option<SerialConsistency>,
     ) -> Result<Self, NextPageError> {
         let page_size = prepared.get_validated_page_size();
-        let timeout = prepared.get_request_timeout().or_else(|| {
+        let request_timeout = prepared.get_request_timeout().or_else(|| {
             prepared
                 .get_execution_profile_handle()?
                 .access()
                 .request_timeout
         });
 
-        let mut worker = SingleConnectionPagerWorker {
-            fetcher: async move |paging_state: PagingState| {
-                connection
-                    .execute_raw_with_consistency(
-                        &prepared,
-                        &values,
-                        consistency,
-                        serial_consistency,
-                        Some(page_size),
-                        paging_state,
-                    )
-                    .await
-            },
-            timeout,
+        let executor = ConnectionPagingExecutor {
+            connection,
+            prepared,
+            values,
+            page_size,
+            consistency,
+            serial_consistency,
+            request_timeout,
         };
 
-        let (first_page, paging_state_response) = worker
-            .query_one_page(PagingState::start())
+        // Fetch the first page on the caller task (no spawning).
+        let request_span = executor.make_span();
+        let outcome = executor
+            .fetch_one_page(&PagingState::start(), &request_span)
+            .instrument(request_span.span().clone())
             .await
-            .map_err(|RequestTimeoutError(timeout)| {
-                NextPageError::RequestFailure(RequestError::RequestTimeout(timeout))
-            })?
-            .map_err(|attempt_error| {
-                NextPageError::RequestFailure(RequestError::LastAttemptError(attempt_error))
-            })?;
+            .map_err(NextPageError::RequestFailure)?;
+        let (first_page, paging_state_response) =
+            ConnectionPagingExecutor::page_from_outcome(outcome)?;
 
         /* PROCESS FIRST PAGE */
         let (sender, receiver) = mpsc::channel::<ResultNextPage>(1);
@@ -1529,7 +1144,10 @@ If you are using this API, you are probably doing something wrong."
             }
             PagingStateResponse::HasMorePages { state } => {
                 /* REMAINING PAGES */
-                let worker_task = async move { worker.work(state, sender).await };
+                let parent_span = tracing::Span::current();
+                let worker_task =
+                    async move { executor.fetch_remaining_pages(state, sender).await }
+                        .instrument(parent_span);
                 let _worker_handle = tokio::task::spawn(worker_task);
             }
         }
@@ -1725,14 +1343,6 @@ where
         Poll::Ready(Some(Ok(value)))
     }
 }
-
-/// Failed to run a request within a provided client timeout.
-#[derive(Error, Debug, Clone)]
-#[error(
-    "Request execution exceeded a client timeout of {}ms",
-    std::time::Duration::as_millis(.0)
-)]
-struct RequestTimeoutError(std::time::Duration);
 
 /// An error returned that occurred during next page fetch.
 #[derive(Error, Debug, Clone)]
