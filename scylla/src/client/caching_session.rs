@@ -104,6 +104,7 @@ where
         query: impl Into<Statement>,
         values: impl SerializeRow,
     ) -> Result<QueryResult, ExecutionError> {
+        let _ = std::hint::black_box(Box::new([14u8; 255]));
         let query = query.into();
         let prepared = self.add_prepared_statement_owned(query).await?;
         self.session.execute_unpaged(&prepared, values).await
