@@ -30,6 +30,7 @@ use itertools::Itertools;
 use precomputed_replicas::PrecomputedReplicas;
 use replicas::{EMPTY_REPLICAS, ReplicasArray};
 use replication_info::ReplicationInfo;
+use smallvec::SmallVec;
 use std::{
     cmp,
     collections::{HashMap, HashSet},
@@ -310,6 +311,23 @@ impl ReplicaLocator {
     }
 }
 
+/// Chooses a random element of `filtered`, a datacenter filter over a replica
+/// list, in a single pass: the matches are collected into a stack buffer and one
+/// of them is picked. Counting them and then walking to the picked one would
+/// traverse the list twice. The buffer fits the replicas of a datacenter for any
+/// realistic replication factor, so no allocation happens on the request path.
+fn choose_from_filtered<T, R>(filtered: impl Iterator<Item = T>, rng: &mut R) -> Option<T>
+where
+    R: Rng + ?Sized,
+{
+    let mut matching: SmallVec<[T; 8]> = filtered.collect();
+    if matching.is_empty() {
+        return None;
+    }
+    let index = rng.random_range(0..matching.len());
+    Some(matching.swap_remove(index))
+}
+
 fn with_computed_shard(node: NodeRef, token: Token) -> (NodeRef, Shard) {
     let shard = node
         .sharder()
@@ -433,6 +451,39 @@ impl<'a> ReplicaSet<'a> {
     where
         R: Rng + ?Sized,
     {
+        // The datacenter-filtered variants have no O(1) `len()`: it walks the
+        // replicas, and `nth()` would walk them again. They are chosen from in
+        // one pass instead.
+        match &self.inner {
+            ReplicaSetInner::FilteredSimple {
+                replicas,
+                datacenter,
+            } => {
+                return choose_from_filtered(
+                    replicas
+                        .iter()
+                        .filter(|node| node.datacenter.as_deref() == Some(*datacenter)),
+                    rng,
+                )
+                .map(|node| with_computed_shard(node, self.token));
+            }
+            ReplicaSetInner::FilteredSharded {
+                replicas,
+                datacenter,
+            } => {
+                return choose_from_filtered(
+                    replicas
+                        .iter()
+                        .filter(|(node, _)| node.datacenter.as_deref() == Some(*datacenter)),
+                    rng,
+                )
+                .map(|(node, shard)| (node, *shard));
+            }
+            ReplicaSetInner::Plain(_)
+            | ReplicaSetInner::PlainSharded(_)
+            | ReplicaSetInner::ChainedNTS { .. } => {}
+        }
+
         let len = self.len();
         if len > 0 {
             let index = rng.random_range(0..len);
@@ -444,22 +495,10 @@ impl<'a> ReplicaSet<'a> {
                 ReplicaSetInner::PlainSharded(replicas) => {
                     replicas.get(index).map(|(node, shard)| (node, *shard))
                 }
-                ReplicaSetInner::FilteredSimple {
-                    replicas,
-                    datacenter,
-                } => replicas
-                    .iter()
-                    .filter(|node| node.datacenter.as_deref() == Some(*datacenter))
-                    .nth(index)
-                    .map(|node| with_computed_shard(node, self.token)),
-                ReplicaSetInner::FilteredSharded {
-                    replicas,
-                    datacenter,
-                } => replicas
-                    .iter()
-                    .filter(|(node, _)| node.datacenter.as_deref() == Some(*datacenter))
-                    .nth(index)
-                    .map(|(node, shard)| (node, *shard)),
+                ReplicaSetInner::FilteredSimple { .. }
+                | ReplicaSetInner::FilteredSharded { .. } => {
+                    unreachable!("chosen from above")
+                }
                 ReplicaSetInner::ChainedNTS {
                     datacenter_repfactors,
                     locator,
