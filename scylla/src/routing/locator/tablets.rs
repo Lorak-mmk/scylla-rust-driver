@@ -410,7 +410,10 @@ pub(crate) struct Tablet {
     tablet_version: Option<TabletVersion>,
     /// If any of the replicas failed to resolve to a Node,
     /// then this field will contain the original list of replicas.
-    failed: Option<RawTabletReplicas>,
+    ///
+    /// Boxed because it is rarely present and would otherwise take a `Vec`'s
+    /// worth of space in every tablet.
+    failed: Option<Box<RawTabletReplicas>>,
 }
 
 impl Tablet {
@@ -454,7 +457,7 @@ impl Tablet {
                     last_token: raw_tablet.last_token,
                     replicas,
                     tablet_version: raw_tablet.tablet_version,
-                    failed: Some(raw_tablet.replicas),
+                    failed: Some(Box::new(raw_tablet.replicas)),
                 },
                 failed_replicas,
             )),
@@ -534,8 +537,10 @@ impl Tablet {
             last_token: Token::new(token),
             replicas: TabletReplicas::new_for_test(replicas),
             tablet_version: None,
-            failed: failed.map(|vec| RawTabletReplicas {
-                replicas: vec.into_iter().map(|id| (id, 0)).collect::<Vec<_>>(),
+            failed: failed.map(|vec| {
+                Box::new(RawTabletReplicas {
+                    replicas: vec.into_iter().map(|id| (id, 0)).collect::<Vec<_>>(),
+                })
             }),
         }
     }
@@ -1371,8 +1376,10 @@ mod tests {
                 all: replicas.into(),
             },
             tablet_version: version.map(TabletVersion::from_server_value),
-            failed: failed.map(|ids| RawTabletReplicas {
-                replicas: ids.into_iter().map(|id| (id, 0)).collect(),
+            failed: failed.map(|ids| {
+                Box::new(RawTabletReplicas {
+                    replicas: ids.into_iter().map(|id| (id, 0)).collect(),
+                })
             }),
         };
         let replicas = || vec![(Arc::clone(&node), 0), (Arc::clone(&other), 1)];
