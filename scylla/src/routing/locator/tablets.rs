@@ -325,7 +325,11 @@ struct TabletReplicas {
     /// list on the fly (see `ReplicaSetInner::FilteredSharded`): a tablet has
     /// only a few replicas, so that is cheaper than a per-datacenter map, both
     /// to query and to keep.
-    all: Vec<(Arc<Node>, Shard)>,
+    ///
+    /// Behind an `Arc` so that cloning a `Tablet` (which happens for every
+    /// tablet of a table whenever one of that table's tablets is updated) is a
+    /// single reference count increment rather than a copy of the list.
+    all: Arc<[(Arc<Node>, Shard)]>,
 }
 
 impl TabletReplicas {
@@ -338,7 +342,7 @@ impl TabletReplicas {
         replica_translator: impl Fn(Uuid) -> Option<Arc<Node>>,
     ) -> Result<Self, (Self, Vec<Uuid>)> {
         let mut failed = Vec::new();
-        let all: Vec<_> = raw_replicas
+        let all: Arc<[_]> = raw_replicas
             .replicas
             .iter()
             .filter_map(|(replica, shard)| {
@@ -505,7 +509,17 @@ impl Tablet {
     }
 
     fn update_stale_nodes(&mut self, recreated_nodes: &HashMap<Uuid, Arc<Node>>) {
-        for (node, _) in self.replicas.all.iter_mut() {
+        // The replica list is shared with the previous `ClusterState`, so it is
+        // only copied (by `make_mut`) if there is something to replace in it.
+        let any_stale = self
+            .replicas
+            .all
+            .iter()
+            .any(|(node, _)| recreated_nodes.contains_key(&node.host_id));
+        if !any_stale {
+            return;
+        }
+        for (node, _) in Arc::make_mut(&mut self.replicas.all).iter_mut() {
             if let Some(new_node) = recreated_nodes.get(&node.host_id) {
                 assert!(!Arc::ptr_eq(new_node, node));
                 *node = Arc::clone(new_node);
@@ -567,7 +581,7 @@ impl TableTablets {
 
     pub(crate) fn replicas_for_token(&self, token: Token) -> Option<&[(Arc<Node>, Shard)]> {
         self.tablet_for_token(token)
-            .map(|tablet| tablet.replicas.all.as_ref())
+            .map(|tablet| &*tablet.replicas.all)
     }
 
     /// Returns the tablet version for the tablet owning `token`, if known.
@@ -1353,7 +1367,9 @@ mod tests {
                     failed: Option<Vec<Uuid>>| Tablet {
             first_token: Token::new(first),
             last_token: Token::new(last),
-            replicas: TabletReplicas { all: replicas },
+            replicas: TabletReplicas {
+                all: replicas.into(),
+            },
             tablet_version: version.map(TabletVersion::from_server_value),
             failed: failed.map(|ids| RawTabletReplicas {
                 replicas: ids.into_iter().map(|id| (id, 0)).collect(),
