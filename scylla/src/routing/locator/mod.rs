@@ -119,19 +119,17 @@ impl ReplicaLocator {
         table_spec: &TableSpec,
     ) -> ReplicaSet<'a> {
         if let Some(tablets) = self.tablets.tablets_for_table(table_spec) {
-            let replicas: Option<&[(Arc<Node>, Shard)]> = if let Some(datacenter) = datacenter {
-                tablets.dc_replicas_for_token(token, datacenter)
-            } else {
-                tablets.replicas_for_token(token)
+            // The table is a tablet table, but we may not have information for the given
+            // token. Let's just return empty set in this case.
+            let replicas = tablets.replicas_for_token(token).unwrap_or(&[]);
+            let inner = match datacenter {
+                Some(datacenter) => ReplicaSetInner::FilteredSharded {
+                    replicas,
+                    datacenter,
+                },
+                None => ReplicaSetInner::PlainSharded(replicas),
             };
-            ReplicaSet {
-                inner: ReplicaSetInner::PlainSharded(replicas.unwrap_or(
-                    // The table is a tablet table, but we don't have information for given token.
-                    // Let's just return empty set in this case.
-                    &[],
-                )),
-                token,
-            }
+            ReplicaSet { inner, token }
         } else {
             match strategy {
                 Strategy::SimpleStrategy { replication_factor } => {
@@ -332,6 +330,14 @@ enum ReplicaSetInner<'a> {
         datacenter: &'a str,
     },
 
+    // Represents a set of tablet replicas that is limited to a specified datacenter.
+    // The replicas are filtered on the fly: a tablet has only a few of them, so
+    // that costs less than looking a datacenter up in a per-tablet map would.
+    FilteredSharded {
+        replicas: &'a [(Arc<Node>, Shard)],
+        datacenter: &'a str,
+    },
+
     // Represents a set of NetworkTopologyStrategy replicas that is not limited to any specific
     // datacenter. The set is constructed lazily, by invoking
     // `locator.get_network_strategy_replicas()`.
@@ -391,6 +397,13 @@ impl<'a> ReplicaSet<'a> {
                 .iter()
                 .filter(|node| node.datacenter.as_deref() == Some(*datacenter))
                 .count(),
+            ReplicaSetInner::FilteredSharded {
+                replicas,
+                datacenter,
+            } => replicas
+                .iter()
+                .filter(|(node, _)| node.datacenter.as_deref() == Some(*datacenter))
+                .count(),
             ReplicaSetInner::ChainedNTS {
                 datacenter_repfactors,
                 locator,
@@ -439,6 +452,14 @@ impl<'a> ReplicaSet<'a> {
                     .filter(|node| node.datacenter.as_deref() == Some(*datacenter))
                     .nth(index)
                     .map(|node| with_computed_shard(node, self.token)),
+                ReplicaSetInner::FilteredSharded {
+                    replicas,
+                    datacenter,
+                } => replicas
+                    .iter()
+                    .filter(|(node, _)| node.datacenter.as_deref() == Some(*datacenter))
+                    .nth(index)
+                    .map(|(node, shard)| (node, *shard)),
                 ReplicaSetInner::ChainedNTS {
                     datacenter_repfactors,
                     locator,
@@ -497,6 +518,14 @@ impl<'a> IntoIterator for ReplicaSet<'a> {
                 datacenter,
                 idx: 0,
             },
+            ReplicaSetInner::FilteredSharded {
+                replicas,
+                datacenter,
+            } => ReplicaSetIteratorInner::FilteredSharded {
+                replicas,
+                datacenter,
+                idx: 0,
+            },
             ReplicaSetInner::ChainedNTS {
                 datacenter_repfactors,
                 locator,
@@ -545,6 +574,12 @@ enum ReplicaSetIteratorInner<'a> {
     /// Token ring with SimpleStrategy, specific datacenter
     FilteredSimple {
         replicas: ReplicasArray<'a>,
+        datacenter: &'a str,
+        idx: usize,
+    },
+    /// Tablets, specific datacenter
+    FilteredSharded {
+        replicas: &'a [(Arc<Node>, Shard)],
         datacenter: &'a str,
         idx: usize,
     },
@@ -602,6 +637,20 @@ impl<'a> Iterator for ReplicaSetIterator<'a> {
 
                 None
             }
+            ReplicaSetIteratorInner::FilteredSharded {
+                replicas,
+                datacenter,
+                idx,
+            } => {
+                while let Some((replica, shard)) = replicas.get(*idx) {
+                    *idx += 1;
+                    if replica.datacenter.as_deref() == Some(*datacenter) {
+                        return Some((replica, *shard));
+                    }
+                }
+
+                None
+            }
             ReplicaSetIteratorInner::ChainedNTS {
                 replicas,
                 replicas_idx,
@@ -642,6 +691,11 @@ impl<'a> Iterator for ReplicaSetIterator<'a> {
                 (size, Some(size))
             }
             ReplicaSetIteratorInner::FilteredSimple {
+                replicas,
+                datacenter: _,
+                idx,
+            } => (0, Some(replicas.len() - *idx)),
+            ReplicaSetIteratorInner::FilteredSharded {
                 replicas,
                 datacenter: _,
                 idx,
@@ -687,7 +741,8 @@ impl<'a> Iterator for ReplicaSetIterator<'a> {
                 }
                 self.next()
             }
-            ReplicaSetIteratorInner::FilteredSimple { .. } => {
+            ReplicaSetIteratorInner::FilteredSimple { .. }
+            | ReplicaSetIteratorInner::FilteredSharded { .. } => {
                 for _i in 0..n {
                     self.next()?;
                 }
@@ -762,8 +817,8 @@ pub struct ReplicasOrderedIterator<'a> {
 
 enum ReplicasOrderedIteratorInner<'a> {
     AlreadyRingOrdered {
-        // In case of Plain, PlainSharded and FilteredSimple variants,
-        // ReplicaSetIterator respects ring order.
+        // In case of Plain, FilteredSimple, PlainSharded and FilteredSharded variants,
+        // ReplicaSetIterator respects ring (or tablet) order.
         replica_set_iter: ReplicaSetIterator<'a>,
     },
     PolyDatacenterNTS {
@@ -950,7 +1005,7 @@ impl<'a> IntoIterator for ReplicasOrdered<'a> {
                         replica_set_iter: replica_set.into_iter(),
                     }
                 }
-                ReplicaSetInner::PlainSharded(_) => {
+                ReplicaSetInner::PlainSharded(_) | ReplicaSetInner::FilteredSharded { .. } => {
                     ReplicasOrderedIteratorInner::AlreadyRingOrdered {
                         replica_set_iter: replica_set.into_iter(),
                     }

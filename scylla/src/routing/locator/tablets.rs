@@ -321,13 +321,16 @@ impl RawTablet {
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(test, derive(Eq))]
 struct TabletReplicas {
+    /// The replicas in payload order. Datacenter-scoped queries filter this
+    /// list on the fly (see `ReplicaSetInner::FilteredSharded`): a tablet has
+    /// only a few replicas, so that is cheaper than a per-datacenter map, both
+    /// to query and to keep.
     all: Vec<(Arc<Node>, Shard)>,
-    per_dc: HashMap<String, Vec<(Arc<Node>, Shard)>>,
 }
 
 impl TabletReplicas {
-    /// Gets raw replica list (which is an array of (Uuid, Shard)), retrieves
-    /// `Node` objects and groups node replicas by DC to make life easier for LBP.
+    /// Gets raw replica list (which is an array of (Uuid, Shard)) and retrieves
+    /// `Node` objects.
     /// In case of failure this function returns Self, but with the problematic nodes skipped,
     /// and a list of skipped uuids - so that the caller can e.g. do some logging.
     pub(crate) fn from_raw_replicas(
@@ -348,39 +351,18 @@ impl TabletReplicas {
             })
             .collect();
 
-        let mut per_dc: HashMap<String, Vec<(Arc<Node>, Shard)>> = HashMap::new();
-        all.iter().for_each(|(replica, shard)| {
-            if let Some(dc) = replica.datacenter.as_ref() {
-                if let Some(replicas) = per_dc.get_mut(dc) {
-                    replicas.push((Arc::clone(replica), *shard));
-                } else {
-                    per_dc.insert(dc.to_string(), vec![(Arc::clone(replica), *shard)]);
-                }
-            }
-        });
-
         if failed.is_empty() {
-            Ok(Self { all, per_dc })
+            Ok(Self { all })
         } else {
-            Err((Self { all, per_dc }, failed))
+            Err((Self { all }, failed))
         }
     }
 
     #[cfg(test)]
     fn new_for_test(replicas: Vec<Arc<Node>>) -> Self {
-        let all = replicas.into_iter().map(|r| (r, 0)).collect::<Vec<_>>();
-        let mut per_dc: HashMap<String, Vec<(Arc<Node>, Shard)>> = HashMap::new();
-        all.iter().for_each(|(replica, shard)| {
-            if let Some(dc) = replica.datacenter.as_ref() {
-                if let Some(replicas) = per_dc.get_mut(dc) {
-                    replicas.push((Arc::clone(replica), *shard));
-                } else {
-                    per_dc.insert(dc.to_string(), vec![(Arc::clone(replica), *shard)]);
-                }
-            }
-        });
-
-        Self { all, per_dc }
+        Self {
+            all: replicas.into_iter().map(|r| (r, 0)).collect(),
+        }
     }
 }
 
@@ -404,22 +386,6 @@ impl PartialEq for TabletReplicas {
             }
             if !Arc::ptr_eq(self_node, other_node) {
                 return false;
-            }
-        }
-
-        // Implementations of `TableTablets`, `Tablet` and `TabletReplicas`
-        // guarantee that if `all` is the same then `per_dc` must be too.
-        // If it isn't then it is a bug.
-        // Comparing `TabletReplicas` happens only in tests so we can sacrifice
-        // a small bit of performance to verify this assumption.
-        assert_eq!(self.per_dc.len(), other.per_dc.len());
-        for (self_k, self_v) in self.per_dc.iter() {
-            let other_v = other.per_dc.get(self_k).unwrap();
-            for ((self_node, self_shard), (other_node, other_shard)) in
-                self_v.iter().zip(other_v.iter())
-            {
-                assert_eq!(self_shard, other_shard);
-                assert!(Arc::ptr_eq(self_node, other_node));
             }
         }
 
@@ -464,12 +430,6 @@ impl Tablet {
         Some((&leader.0, leader.1))
     }
 
-    // Ignore clippy lints here. Clippy suggests to
-    // Box<> `Err` variant, because it's too large. It does not
-    // make much sense to do so, looking at the caller of this function.
-    // Tablet returned in `Err` variant is used as if no error appeared.
-    // The only difference is that we use node ids to emit some debug logs.
-    #[expect(clippy::result_large_err)]
     pub(crate) fn from_raw_tablet(
         raw_tablet: RawTablet,
         replica_translator: impl Fn(Uuid) -> Option<Arc<Node>>,
@@ -545,24 +505,10 @@ impl Tablet {
     }
 
     fn update_stale_nodes(&mut self, recreated_nodes: &HashMap<Uuid, Arc<Node>>) {
-        let mut any_updated = false;
         for (node, _) in self.replicas.all.iter_mut() {
             if let Some(new_node) = recreated_nodes.get(&node.host_id) {
                 assert!(!Arc::ptr_eq(new_node, node));
-                any_updated = true;
                 *node = Arc::clone(new_node);
-            }
-        }
-
-        if any_updated {
-            // Now that we know we have some nodes to update we need to go over
-            // per-dc nodes and update them too.
-            for dc_nodes in self.replicas.per_dc.values_mut() {
-                for (node, _) in dc_nodes.iter_mut() {
-                    if let Some(new_node) = recreated_nodes.get(&node.host_id) {
-                        *node = Arc::clone(new_node);
-                    }
-                }
             }
         }
     }
@@ -622,21 +568,6 @@ impl TableTablets {
     pub(crate) fn replicas_for_token(&self, token: Token) -> Option<&[(Arc<Node>, Shard)]> {
         self.tablet_for_token(token)
             .map(|tablet| tablet.replicas.all.as_ref())
-    }
-
-    pub(crate) fn dc_replicas_for_token(
-        &self,
-        token: Token,
-        dc: &str,
-    ) -> Option<&[(Arc<Node>, Shard)]> {
-        self.tablet_for_token(token).map(|tablet| {
-            tablet
-                .replicas
-                .per_dc
-                .get(dc)
-                .map(|x| x.as_slice())
-                .unwrap_or(&[])
-        })
     }
 
     /// Returns the tablet version for the tablet owning `token`, if known.
@@ -1264,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_replicas_to_replicas_groups_correctly() {
+    fn raw_replicas_resolve_in_order() {
         let nodes: HashMap<Uuid, Arc<Node>> = [
             Node::new_for_test(
                 Some(Uuid::from_u64_pair(1, 1)),
@@ -1324,27 +1255,6 @@ mod tests {
 
         let replicas = TabletReplicas::from_raw_replicas(&raw_replicas, translator);
 
-        let mut per_dc = HashMap::new();
-        per_dc.insert(
-            "dc1".to_string(),
-            vec![
-                (translator(Uuid::from_u64_pair(1, 1)).unwrap(), 1),
-                (translator(Uuid::from_u64_pair(1, 6)).unwrap(), 1),
-            ],
-        );
-        per_dc.insert(
-            "dc2".to_string(),
-            vec![
-                (translator(Uuid::from_u64_pair(1, 2)).unwrap(), 1),
-                (translator(Uuid::from_u64_pair(1, 4)).unwrap(), 1),
-                (translator(Uuid::from_u64_pair(1, 5)).unwrap(), 1),
-            ],
-        );
-        per_dc.insert(
-            "dc3".to_string(),
-            vec![(translator(Uuid::from_u64_pair(1, 3)).unwrap(), 1)],
-        );
-
         assert_eq!(
             replicas,
             Ok(TabletReplicas {
@@ -1353,7 +1263,6 @@ mod tests {
                     .cloned()
                     .map(|replica| (translator(replica).unwrap(), 1))
                     .collect(),
-                per_dc
             })
         );
     }
@@ -1444,10 +1353,7 @@ mod tests {
                     failed: Option<Vec<Uuid>>| Tablet {
             first_token: Token::new(first),
             last_token: Token::new(last),
-            replicas: TabletReplicas {
-                all: replicas,
-                per_dc: HashMap::new(),
-            },
+            replicas: TabletReplicas { all: replicas },
             tablet_version: version.map(TabletVersion::from_server_value),
             failed: failed.map(|ids| RawTabletReplicas {
                 replicas: ids.into_iter().map(|id| (id, 0)).collect(),
