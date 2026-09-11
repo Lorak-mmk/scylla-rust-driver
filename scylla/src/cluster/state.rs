@@ -737,34 +737,58 @@ impl ClusterState {
         &self.topology.known_nodes
     }
 
-    pub(crate) fn update_tablets(&mut self, raw_tablets: Vec<(TableSpec<'static>, RawTablet)>) {
+    /// Returns a copy of `self` with `raw_tablets` recorded, or `None` if every
+    /// one of them is already recorded exactly as given, so that there is nothing
+    /// new to publish.
+    ///
+    /// The `None` case is common: every in-flight request to a not yet learned
+    /// tablet triggers feedback for it, so the same tablet tends to arrive many
+    /// times in a row. Detecting that before cloning `self` keeps those repeats
+    /// from each producing a new `ClusterState`.
+    pub(crate) fn with_updated_tablets(
+        &self,
+        raw_tablets: Vec<(TableSpec<'static>, RawTablet)>,
+    ) -> Option<ClusterState> {
         let replica_translator = |uuid: Uuid| self.topology.known_nodes.get(&uuid).cloned();
 
-        for (table, raw_tablet) in raw_tablets.into_iter() {
-            // Should we skip tablets that belong to a keyspace not present in
-            // self.keyspaces? The keyspace could have been, without driver's knowledge:
-            // 1. Dropped - in which case we'll remove its info soon (when refreshing
-            // topology) anyway.
-            // 2. Created - no harm in storing the info now.
-            //
-            // So I think we can safely skip checking keyspace presence.
-            let tablet = match Tablet::from_raw_tablet(raw_tablet, replica_translator) {
-                Ok(t) => t,
-                Err((t, f)) => {
-                    debug!(
-                        "Nodes ({}) that are replicas for a tablet {{ks: {}, table: {}, range: [{}. {}]}} not present in current ClusterState.known_nodes. \
-                       Skipping these replicas until topology refresh",
-                        f.iter().safe_format(", "),
-                        table.ks_name(),
-                        table.table_name(),
-                        t.range().0.value(),
-                        t.range().1.value()
-                    );
-                    t
-                }
-            };
-            self.locator.tablets.add_tablet(table, tablet);
+        let new_tablets: Vec<(TableSpec<'static>, Tablet)> = raw_tablets
+            .into_iter()
+            .filter_map(|(table, raw_tablet)| {
+                // Should we skip tablets that belong to a keyspace not present in
+                // self.keyspaces? The keyspace could have been, without driver's knowledge:
+                // 1. Dropped - in which case we'll remove its info soon (when refreshing
+                // topology) anyway.
+                // 2. Created - no harm in storing the info now.
+                //
+                // So I think we can safely skip checking keyspace presence.
+                let tablet = match Tablet::from_raw_tablet(raw_tablet, replica_translator) {
+                    Ok(t) => t,
+                    Err((t, f)) => {
+                        debug!(
+                            "Nodes ({}) that are replicas for a tablet {{ks: {}, table: {}, range: [{}. {}]}} not present in current ClusterState.known_nodes. \
+                           Skipping these replicas until topology refresh",
+                            f.iter().safe_format(", "),
+                            table.ks_name(),
+                            table.table_name(),
+                            t.range().0.value(),
+                            t.range().1.value()
+                        );
+                        t
+                    }
+                };
+                (!self.locator.tablets.contains(&table, &tablet)).then_some((table, tablet))
+            })
+            .collect();
+
+        if new_tablets.is_empty() {
+            return None;
         }
+
+        let mut new_state = self.clone();
+        for (table, tablet) in new_tablets {
+            new_state.locator.tablets.add_tablet(table, tablet);
+        }
+        Some(new_state)
     }
 }
 
@@ -854,6 +878,7 @@ mod tests {
     use crate::cluster::metadata::{Metadata, Peer};
     use crate::cluster::node::NodeAddr;
     use crate::policies::host_filter::HostFilter;
+    use crate::routing::locator::tablets::RawTablet;
     use crate::test_utils::setup_tracing;
 
     use std::collections::{HashMap, HashSet};
@@ -1056,6 +1081,69 @@ mod tests {
         assert!(
             Arc::ptr_eq(&old_node, new_node),
             "Node object should be reused when disabled node's attributes haven't changed"
+        );
+    }
+
+    // Tablet feedback that repeats what the state already holds must not
+    // produce a new state; feedback that changes anything must.
+    #[tokio::test]
+    async fn tablet_update_is_skipped_when_nothing_changes() {
+        setup_tracing();
+
+        let host_id = Uuid::new_v4();
+        let metadata = make_metadata(vec![make_peer(
+            host_id,
+            make_addr(1),
+            Some("dc1"),
+            Some("r1"),
+        )]);
+        let state = new_cluster_state(metadata, None).await;
+
+        let table = TableSpec::borrowed("ks", "t").into_owned();
+        let tablet = |first, last, shard, version| {
+            (
+                table.clone(),
+                RawTablet::new_for_test(first, last, vec![(host_id, shard)], version),
+            )
+        };
+
+        let state = state
+            .with_updated_tablets(vec![tablet(0, 100, 0, Some(1))])
+            .expect("a new tablet changes the state");
+
+        assert!(
+            state
+                .with_updated_tablets(vec![tablet(0, 100, 0, Some(1))])
+                .is_none(),
+            "the same tablet again changes nothing"
+        );
+        assert!(
+            state
+                .with_updated_tablets(vec![tablet(0, 100, 0, Some(1)), tablet(0, 100, 0, Some(1))])
+                .is_none(),
+            "nor does a whole batch of it"
+        );
+
+        // Any difference does change the state: version, shard, or range.
+        for changed in [
+            tablet(0, 100, 0, Some(2)),
+            tablet(0, 100, 1, Some(1)),
+            tablet(0, 50, 0, Some(1)),
+        ] {
+            assert!(state.with_updated_tablets(vec![changed]).is_some());
+        }
+
+        // A batch mixing a known tablet with a new one is applied.
+        let state = state
+            .with_updated_tablets(vec![
+                tablet(0, 100, 0, Some(1)),
+                tablet(101, 200, 0, Some(3)),
+            ])
+            .expect("the new tablet changes the state");
+        assert!(
+            state
+                .with_updated_tablets(vec![tablet(101, 200, 0, Some(3))])
+                .is_none()
         );
     }
 }

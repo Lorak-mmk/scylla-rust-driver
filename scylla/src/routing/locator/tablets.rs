@@ -501,6 +501,27 @@ impl Tablet {
         (self.first_token, self.last_token)
     }
 
+    /// Whether `other` carries exactly the routing information `self` does: the
+    /// same token range and version, the same replicas (by `Node` identity and
+    /// shard) in the same order, and all replicas resolved in both.
+    ///
+    /// Replicas are compared by `Arc::ptr_eq`, not by host id: two `Node` objects
+    /// with the same host id may differ (e.g. after a node's address changed), and
+    /// then the tablet does need to be replaced.
+    fn is_same_as(&self, other: &Tablet) -> bool {
+        self.first_token == other.first_token
+            && self.last_token == other.last_token
+            && self.tablet_version == other.tablet_version
+            && self.failed.is_none()
+            && other.failed.is_none()
+            && self.replicas.all.len() == other.replicas.all.len()
+            && self.replicas.all.iter().zip(other.replicas.all.iter()).all(
+                |((node, shard), (other_node, other_shard))| {
+                    shard == other_shard && Arc::ptr_eq(node, other_node)
+                },
+            )
+    }
+
     // Returns `Ok(())` if after the operation Tablet replicas are fully resolved.
     // Return `Err(replicas)` if some replicas failed to resolve. `replicas` is a
     // list of Uuids that failed to resolve.
@@ -634,6 +655,13 @@ impl TableTablets {
         self.tablet_for_token(token)?.known_leader()
     }
 
+    /// Whether `tablet` is already present exactly as given (see
+    /// [`Tablet::is_same_as`]), so that adding it would change nothing.
+    fn contains(&self, tablet: &Tablet) -> bool {
+        self.tablet_for_token(tablet.first_token)
+            .is_some_and(|present| present.is_same_as(tablet))
+    }
+
     /// This method:
     /// - first removes all tablets that overlap with `tablet` from `self`
     /// - adds `tablet` to `self`
@@ -758,6 +786,13 @@ impl TabletsInfo {
     ) -> Option<&'a TableTablets> {
         let query_key = TableSpecQueryKey { table_spec };
         self.tablets.get(&query_key)
+    }
+
+    /// Whether `tablet` is already present for `table_spec` exactly as given, so
+    /// that adding it would change nothing. See [`TableTablets::contains`].
+    pub(crate) fn contains(&self, table_spec: &TableSpec<'_>, tablet: &Tablet) -> bool {
+        self.tablets_for_table(table_spec)
+            .is_some_and(|tablets| tablets.contains(tablet))
     }
 
     pub(crate) fn add_tablet(&mut self, table_spec: TableSpec<'static>, tablet: Tablet) {
@@ -916,11 +951,11 @@ mod tests {
     use uuid::Uuid;
 
     use crate::cluster::Node;
-    use crate::routing::Token;
     use crate::routing::locator::tablets::{
         CUSTOM_PAYLOAD_TABLETS_V1_KEY, CUSTOM_PAYLOAD_TABLETS_V2_KEY, RAW_TABLETS_V1_CQL_TYPE,
         RAW_TABLETS_V2_CQL_TYPE, RawTablet, RawTabletReplicas, TabletParsingError, TabletVersion,
     };
+    use crate::routing::{Shard, Token};
     use crate::test_utils::setup_tracing;
     use crate::value::CqlValue;
 
@@ -1378,6 +1413,96 @@ mod tests {
             Some(&tablets.tablet_list[0])
         );
         assert_eq!(tablets.tablet_for_token(Token::new(1001)), None);
+    }
+
+    // `TableTablets::contains` must report a tablet as present only when it
+    // matches exactly, so that no genuine change is ever skipped.
+    #[test]
+    fn contains_requires_exact_match() {
+        let node = Arc::new(Node::new_for_test(
+            Some(Uuid::from_u64_pair(1, 1)),
+            None,
+            None,
+            None,
+        ));
+        // Same host id, different object: the tablet must be replaced then.
+        let recreated = Arc::new(Node::new_for_test(Some(node.host_id), None, None, None));
+        let other = Arc::new(Node::new_for_test(
+            Some(Uuid::from_u64_pair(1, 2)),
+            None,
+            None,
+            None,
+        ));
+        let unknown = Uuid::from_u64_pair(9, 9);
+
+        let make = |first: i64,
+                    last: i64,
+                    replicas: Vec<(Arc<Node>, Shard)>,
+                    version: Option<i64>,
+                    failed: Option<Vec<Uuid>>| Tablet {
+            first_token: Token::new(first),
+            last_token: Token::new(last),
+            replicas: TabletReplicas {
+                all: replicas,
+                per_dc: HashMap::new(),
+            },
+            tablet_version: version.map(TabletVersion::from_server_value),
+            failed: failed.map(|ids| RawTabletReplicas {
+                replicas: ids.into_iter().map(|id| (id, 0)).collect(),
+            }),
+        };
+        let replicas = || vec![(Arc::clone(&node), 0), (Arc::clone(&other), 1)];
+
+        let mut tablets = TableTablets::new_for_test();
+        tablets.add_tablet(make(0, 100, replicas(), Some(7), None));
+
+        assert!(tablets.contains(&make(0, 100, replicas(), Some(7), None)));
+
+        let differing = [
+            // Range.
+            make(0, 99, replicas(), Some(7), None),
+            make(1, 100, replicas(), Some(7), None),
+            // Version.
+            make(0, 100, replicas(), Some(8), None),
+            make(0, 100, replicas(), None, None),
+            // Shard.
+            make(
+                0,
+                100,
+                vec![(Arc::clone(&node), 1), (Arc::clone(&other), 1)],
+                Some(7),
+                None,
+            ),
+            // Replica order (the first replica is the leader).
+            make(
+                0,
+                100,
+                vec![(Arc::clone(&other), 1), (Arc::clone(&node), 0)],
+                Some(7),
+                None,
+            ),
+            // Replica count.
+            make(0, 100, vec![(Arc::clone(&node), 0)], Some(7), None),
+            // A recreated `Node` object for the same host.
+            make(
+                0,
+                100,
+                vec![(Arc::clone(&recreated), 0), (Arc::clone(&other), 1)],
+                Some(7),
+                None,
+            ),
+            // Unresolved replicas.
+            make(0, 100, replicas(), Some(7), Some(vec![unknown])),
+        ];
+        for tablet in differing {
+            assert!(!tablets.contains(&tablet), "{tablet:?}");
+        }
+
+        // A present tablet with unresolved replicas never counts as already
+        // there: the next feedback may resolve them.
+        let mut tablets = TableTablets::new_for_test();
+        tablets.add_tablet(make(0, 100, replicas(), Some(7), Some(vec![unknown])));
+        assert!(!tablets.contains(&make(0, 100, replicas(), Some(7), Some(vec![unknown]))));
     }
 
     #[test]
