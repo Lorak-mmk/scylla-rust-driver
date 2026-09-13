@@ -751,44 +751,44 @@ impl ClusterState {
     ) -> Option<ClusterState> {
         let replica_translator = |uuid: Uuid| self.topology.known_nodes.get(&uuid).cloned();
 
-        let new_tablets: Vec<(TableSpec<'static>, Tablet)> = raw_tablets
-            .into_iter()
-            .filter_map(|(table, raw_tablet)| {
-                // Should we skip tablets that belong to a keyspace not present in
-                // self.keyspaces? The keyspace could have been, without driver's knowledge:
-                // 1. Dropped - in which case we'll remove its info soon (when refreshing
-                // topology) anyway.
-                // 2. Created - no harm in storing the info now.
-                //
-                // So I think we can safely skip checking keyspace presence.
-                let tablet = match Tablet::from_raw_tablet(raw_tablet, replica_translator) {
-                    Ok(t) => t,
-                    Err((t, f)) => {
-                        debug!(
-                            "Nodes ({}) that are replicas for a tablet {{ks: {}, table: {}, range: [{}. {}]}} not present in current ClusterState.known_nodes. \
-                           Skipping these replicas until topology refresh",
-                            f.iter().safe_format(", "),
-                            table.ks_name(),
-                            table.table_name(),
-                            t.range().0.value(),
-                            t.range().1.value()
-                        );
-                        t
-                    }
-                };
-                (!self.locator.tablets.contains(&table, &tablet)).then_some((table, tablet))
-            })
-            .collect();
+        // Cloned lazily, by the first tablet that turns out to change anything.
+        let mut new_state: Option<ClusterState> = None;
 
-        if new_tablets.is_empty() {
-            return None;
+        for (table, raw_tablet) in raw_tablets {
+            // Should we skip tablets that belong to a keyspace not present in
+            // self.keyspaces? The keyspace could have been, without driver's knowledge:
+            // 1. Dropped - in which case we'll remove its info soon (when refreshing
+            // topology) anyway.
+            // 2. Created - no harm in storing the info now.
+            //
+            // So I think we can safely skip checking keyspace presence.
+            let tablet = match Tablet::from_raw_tablet(raw_tablet, replica_translator) {
+                Ok(t) => t,
+                Err((t, f)) => {
+                    debug!(
+                        "Nodes ({}) that are replicas for a tablet {{ks: {}, table: {}, range: [{}. {}]}} not present in current ClusterState.known_nodes. \
+                       Skipping these replicas until topology refresh",
+                        f.iter().safe_format(", "),
+                        table.ks_name(),
+                        table.table_name(),
+                        t.range().0.value(),
+                        t.range().1.value()
+                    );
+                    t
+                }
+            };
+
+            if self.locator.tablets.contains(&table, &tablet) {
+                continue;
+            }
+            new_state
+                .get_or_insert_with(|| self.clone())
+                .locator
+                .tablets
+                .add_tablet(table, tablet);
         }
 
-        let mut new_state = self.clone();
-        for (table, tablet) in new_tablets {
-            new_state.locator.tablets.add_tablet(table, tablet);
-        }
-        Some(new_state)
+        new_state
     }
 }
 
