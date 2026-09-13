@@ -93,7 +93,17 @@ pub(crate) enum TabletParsingError {
         "First element of tablet payload token range must be strictly smaller than the second, but the range is ({0}, {1}]"
     )]
     WrongTokenRange(i64, i64),
+    #[error("Tablet has {0} replicas, more than the supported maximum of {MAX_TABLET_REPLICAS}")]
+    TooManyReplicas(usize),
 }
+
+/// The most replicas a single tablet may have for the driver to record it.
+///
+/// A subset of a tablet's replicas (e.g. those in one datacenter) is
+/// represented as a `u64` mask of positions in the replica list, which bounds
+/// the list at 64 entries. No realistic replication setup comes close: it
+/// would take more than 64 replicas summed over all datacenters.
+pub(crate) const MAX_TABLET_REPLICAS: usize = u64::BITS as usize;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct RawTabletReplicas {
@@ -303,6 +313,10 @@ impl RawTablet {
                     })
             })
             .collect::<Result<Vec<(Uuid, Shard)>, TabletParsingError>>()?;
+
+        if replicas.len() > MAX_TABLET_REPLICAS {
+            return Err(TabletParsingError::TooManyReplicas(replicas.len()));
+        }
 
         Ok(RawTablet {
             // +1 because ScyllaDB sends left-open range, so received
@@ -904,8 +918,9 @@ mod tests {
 
     use crate::cluster::Node;
     use crate::routing::locator::tablets::{
-        CUSTOM_PAYLOAD_TABLETS_V1_KEY, CUSTOM_PAYLOAD_TABLETS_V2_KEY, RAW_TABLETS_V1_CQL_TYPE,
-        RAW_TABLETS_V2_CQL_TYPE, RawTablet, RawTabletReplicas, TabletParsingError, TabletVersion,
+        CUSTOM_PAYLOAD_TABLETS_V1_KEY, CUSTOM_PAYLOAD_TABLETS_V2_KEY, MAX_TABLET_REPLICAS,
+        RAW_TABLETS_V1_CQL_TYPE, RAW_TABLETS_V2_CQL_TYPE, RawTablet, RawTabletReplicas,
+        TabletParsingError, TabletVersion,
     };
     use crate::routing::{Shard, Token};
     use crate::test_utils::setup_tracing;
@@ -1012,6 +1027,41 @@ mod tests {
         // Sanity check: valid range still works
         let payload = make_tablet_custom_payload(99, 100);
         assert_matches::assert_matches!(RawTablet::from_custom_payload(&payload), Some(Ok(_)));
+    }
+
+    #[test]
+    fn test_raw_tablet_deser_too_many_replicas() {
+        let payload_with_replicas = |count: usize| {
+            let replicas = (0..count)
+                .map(|i| {
+                    CqlValue::Tuple(vec![
+                        Some(CqlValue::Uuid(Uuid::from_u64_pair(1, i as u64))),
+                        Some(CqlValue::Int(0)),
+                    ])
+                })
+                .collect();
+            let value = CqlValue::Tuple(vec![
+                Some(CqlValue::BigInt(0)),
+                Some(CqlValue::BigInt(100)),
+                Some(CqlValue::List(replicas)),
+            ]);
+            let mut data = vec![];
+            SerializeValue::serialize(&value, &RAW_TABLETS_V1_CQL_TYPE, CellWriter::new(&mut data))
+                .unwrap();
+            HashMap::from([(
+                CUSTOM_PAYLOAD_TABLETS_V1_KEY.to_string(),
+                Bytes::copy_from_slice(&data[4..]),
+            )])
+        };
+
+        assert_matches::assert_matches!(
+            RawTablet::from_custom_payload(&payload_with_replicas(MAX_TABLET_REPLICAS)),
+            Some(Ok(_))
+        );
+        assert_matches::assert_matches!(
+            RawTablet::from_custom_payload(&payload_with_replicas(MAX_TABLET_REPLICAS + 1)),
+            Some(Err(TabletParsingError::TooManyReplicas(n))) if n == MAX_TABLET_REPLICAS + 1
+        );
     }
 
     #[test]
