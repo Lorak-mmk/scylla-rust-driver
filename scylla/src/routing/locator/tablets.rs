@@ -76,6 +76,7 @@ use crate::cluster::Node;
 use crate::routing::{Shard, Token};
 use crate::utils::safe_format::IteratorSafeFormatExt;
 use rand::Rng as _;
+use smallvec::SmallVec;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
@@ -336,7 +337,7 @@ impl RawTablet {
 #[cfg_attr(test, derive(Eq))]
 struct TabletReplicas {
     /// The replicas in payload order. A datacenter-scoped query is answered
-    /// with a mask of positions in this list (see [`Self::dc_mask`] and
+    /// with a mask of positions in this list (see `dc_masks` and
     /// `ReplicaSetInner::MaskedSharded`); [`MAX_TABLET_REPLICAS`] guarantees
     /// the list fits one.
     ///
@@ -344,6 +345,16 @@ struct TabletReplicas {
     /// tablet of a table whenever one of that table's tablets is updated) is a
     /// single reference count increment rather than a copy of the list.
     all: Arc<[(Arc<Node>, Shard)]>,
+    /// One mask per datacenter among the replicas: the positions in `all` of
+    /// the replicas in that datacenter. Which datacenter a mask stands for is
+    /// told by its first replica, `all[mask.trailing_zeros()]`, so no name is
+    /// stored and a datacenter query costs one comparison per datacenter of the
+    /// tablet instead of one per replica - and does not depend on where in the
+    /// list the datacenter's replicas are.
+    ///
+    /// Replicas whose node has no datacenter are in no mask: they match no
+    /// datacenter query.
+    dc_masks: SmallVec<[u64; 3]>,
 }
 
 impl TabletReplicas {
@@ -356,7 +367,7 @@ impl TabletReplicas {
         replica_translator: impl Fn(Uuid) -> Option<Arc<Node>>,
     ) -> Result<Self, (Self, Vec<Uuid>)> {
         let mut failed = Vec::new();
-        let all: Arc<[_]> = raw_replicas
+        let all: Arc<[(Arc<Node>, Shard)]> = raw_replicas
             .replicas
             .iter()
             .filter_map(|(replica, shard)| {
@@ -370,30 +381,48 @@ impl TabletReplicas {
             .collect();
 
         if failed.is_empty() {
-            Ok(Self { all })
+            Ok(Self::new(all))
         } else {
-            Err((Self { all }, failed))
+            Err((Self::new(all), failed))
         }
     }
 
-    /// Mask of the positions in `all` of the replicas in datacenter `dc`.
-    ///
-    /// Computed by one scan of the list: a tablet has only a few replicas, so
-    /// that is cheaper than looking a datacenter up in a per-tablet map would be.
+    fn new(all: Arc<[(Arc<Node>, Shard)]>) -> Self {
+        debug_assert!(all.len() <= MAX_TABLET_REPLICAS);
+        let mut dc_masks: SmallVec<[u64; 3]> = SmallVec::new();
+        for (i, (node, _)) in all.iter().enumerate() {
+            let Some(dc) = node.datacenter.as_deref() else {
+                continue;
+            };
+            match dc_masks
+                .iter_mut()
+                .find(|mask| Self::datacenter_of_mask(&all, **mask) == Some(dc))
+            {
+                Some(mask) => *mask |= 1 << i,
+                None => dc_masks.push(1 << i),
+            }
+        }
+        Self { all, dc_masks }
+    }
+
+    /// The datacenter a mask of `dc_masks` stands for: that of its first replica.
+    fn datacenter_of_mask(all: &[(Arc<Node>, Shard)], mask: u64) -> Option<&str> {
+        all[mask.trailing_zeros() as usize].0.datacenter.as_deref()
+    }
+
+    /// Mask of the positions in `all` of the replicas in datacenter `dc`; zero
+    /// if there are none.
     fn dc_mask(&self, dc: &str) -> u64 {
-        debug_assert!(self.all.len() <= MAX_TABLET_REPLICAS);
-        self.all
+        self.dc_masks
             .iter()
-            .enumerate()
-            .filter(|(_, (node, _))| node.datacenter.as_deref() == Some(dc))
-            .fold(0, |mask, (i, _)| mask | (1 << i))
+            .copied()
+            .find(|mask| Self::datacenter_of_mask(&self.all, *mask) == Some(dc))
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
     fn new_for_test(replicas: Vec<Arc<Node>>) -> Self {
-        Self {
-            all: replicas.into_iter().map(|r| (r, 0)).collect(),
-        }
+        Self::new(replicas.into_iter().map(|r| (r, 0)).collect())
     }
 }
 
@@ -555,6 +584,8 @@ impl Tablet {
                 *node = Arc::clone(new_node);
             }
         }
+        // A recreated node may be in another datacenter now.
+        self.replicas = TabletReplicas::new(Arc::clone(&self.replicas.all));
     }
 
     #[cfg(test)]
@@ -1354,14 +1385,57 @@ mod tests {
 
         assert_eq!(
             replicas,
-            Ok(TabletReplicas {
-                all: replicas_uids
+            Ok(TabletReplicas::new(
+                replicas_uids
                     .iter()
                     .cloned()
                     .map(|replica| (translator(replica).unwrap(), 1))
                     .collect(),
-            })
+            ))
         );
+    }
+
+    // The per-datacenter masks must cover exactly the replicas in each
+    // datacenter, leave nodes without a datacenter out, and follow a node
+    // that is recreated in another datacenter.
+    #[test]
+    fn dc_masks_index_replicas_by_datacenter() {
+        let node = |id: u64, dc: Option<&str>| {
+            Arc::new(Node::new_for_test(
+                Some(Uuid::from_u64_pair(1, id)),
+                None,
+                dc.map(str::to_owned),
+                None,
+            ))
+        };
+        let replicas = TabletReplicas::new(
+            [
+                (node(1, Some(DC1)), 0),
+                (node(2, Some(DC2)), 0),
+                (node(3, None), 0),
+                (node(4, Some(DC1)), 0),
+                (node(5, Some(DC2)), 0),
+            ]
+            .into(),
+        );
+        assert_eq!(replicas.dc_mask(DC1), 0b01001);
+        assert_eq!(replicas.dc_mask(DC2), 0b10010);
+        assert_eq!(replicas.dc_mask(DC3), 0);
+        assert_eq!(replicas.dc_masks.len(), 2);
+
+        // Node 4 moves to DC3 (a recreated `Node` object with the same host id).
+        let mut tablet = Tablet {
+            first_token: Token::new(0),
+            last_token: Token::new(1),
+            replicas,
+            tablet_version: None,
+            failed: None,
+        };
+        let moved = node(4, Some(DC3));
+        tablet.update_stale_nodes(&HashMap::from([(moved.host_id, moved)]));
+        assert_eq!(tablet.replicas.dc_mask(DC1), 0b00001);
+        assert_eq!(tablet.replicas.dc_mask(DC2), 0b10010);
+        assert_eq!(tablet.replicas.dc_mask(DC3), 0b01000);
     }
 
     #[test]
@@ -1450,9 +1524,7 @@ mod tests {
                     failed: Option<Vec<Uuid>>| Tablet {
             first_token: Token::new(first),
             last_token: Token::new(last),
-            replicas: TabletReplicas {
-                all: replicas.into(),
-            },
+            replicas: TabletReplicas::new(replicas.into()),
             tablet_version: version.map(TabletVersion::from_server_value),
             failed: failed.map(|ids| {
                 Box::new(RawTabletReplicas {
