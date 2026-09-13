@@ -335,10 +335,10 @@ impl RawTablet {
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(test, derive(Eq))]
 struct TabletReplicas {
-    /// The replicas in payload order. Datacenter-scoped queries filter this
-    /// list on the fly (see `ReplicaSetInner::FilteredSharded`): a tablet has
-    /// only a few replicas, so that is cheaper than a per-datacenter map, both
-    /// to query and to keep.
+    /// The replicas in payload order. A datacenter-scoped query is answered
+    /// with a mask of positions in this list (see [`Self::dc_mask`] and
+    /// `ReplicaSetInner::MaskedSharded`); [`MAX_TABLET_REPLICAS`] guarantees
+    /// the list fits one.
     ///
     /// Behind an `Arc` so that cloning a `Tablet` (which happens for every
     /// tablet of a table whenever one of that table's tablets is updated) is a
@@ -374,6 +374,19 @@ impl TabletReplicas {
         } else {
             Err((Self { all }, failed))
         }
+    }
+
+    /// Mask of the positions in `all` of the replicas in datacenter `dc`.
+    ///
+    /// Computed by one scan of the list: a tablet has only a few replicas, so
+    /// that is cheaper than looking a datacenter up in a per-tablet map would be.
+    fn dc_mask(&self, dc: &str) -> u64 {
+        debug_assert!(self.all.len() <= MAX_TABLET_REPLICAS);
+        self.all
+            .iter()
+            .enumerate()
+            .filter(|(_, (node, _))| node.datacenter.as_deref() == Some(dc))
+            .fold(0, |mask, (i, _)| mask | (1 << i))
     }
 
     #[cfg(test)]
@@ -560,6 +573,10 @@ impl Tablet {
     }
 }
 
+/// A tablet's replicas together with a mask of the positions of a subset of
+/// them, see [`TabletReplicas::dc_mask`].
+pub(crate) type MaskedReplicas<'a> = (&'a [(Arc<Node>, Shard)], u64);
+
 /// Container for tablets of a single table.
 ///
 /// It can be viewed as a set of non-overlapping Tablet objects.
@@ -601,6 +618,17 @@ impl TableTablets {
     pub(crate) fn replicas_for_token(&self, token: Token) -> Option<&[(Arc<Node>, Shard)]> {
         self.tablet_for_token(token)
             .map(|tablet| &*tablet.replicas.all)
+    }
+
+    /// The replicas of the tablet owning `token` together with the mask of
+    /// those of them that are in datacenter `dc`.
+    pub(crate) fn dc_replicas_for_token(
+        &self,
+        token: Token,
+        dc: &str,
+    ) -> Option<MaskedReplicas<'_>> {
+        self.tablet_for_token(token)
+            .map(|tablet| (&*tablet.replicas.all, tablet.replicas.dc_mask(dc)))
     }
 
     /// Returns the tablet version for the tablet owning `token`, if known.

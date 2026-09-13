@@ -866,11 +866,15 @@ async fn test_tablet_replica_sets() {
             .is_none()
     );
 
-    // `nth` and `size_hint` of the filtered iterator.
+    // `nth` and `size_hint` of the datacenter-scoped iterator.
     let mut iter = set(Some("eu")).into_iter();
-    assert_eq!(iter.size_hint(), (0, Some(4)));
+    assert_eq!(iter.size_hint(), (2, Some(2)));
     assert_eq!(port(iter.nth(1)), Some(G));
+    assert_eq!(iter.size_hint(), (0, Some(0)));
     assert_eq!(port(iter.next()), None);
+    let mut iter = set(Some("eu")).into_iter();
+    assert_eq!(port(iter.nth(usize::MAX)), None);
+    assert_eq!(iter.size_hint(), (0, Some(0)));
 
     // A token no tablet is known for yields an empty set.
     assert!(
